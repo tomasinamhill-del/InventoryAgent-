@@ -19,6 +19,7 @@ Every tool adheres strictly to:
 
 from __future__ import annotations
 import math
+import re
 from dataclasses import dataclass, field, asdict
 from statistics import NormalDist
 from typing import List, Optional, Dict, Any, Union, Tuple
@@ -2240,3 +2241,531 @@ def calculate_newsvendor(
         verification=verification,
         audit=audit,
     )
+
+
+# ============================================================================
+# 6. Multicriteria Inventory Classification (Course Stratification Methodology)
+# ============================================================================
+
+MODULE_3_POLICIES: Dict[str, Dict[str, str]] = {
+    "A": {
+        "cycle_count": "Cycle count every week",
+        "csl_policy": "High CSL: 95%–98%",
+        "description": "Critical items: High dollar velocity or high transaction frequency. Weekly physical audit and tight safety stock control.",
+    },
+    "B": {
+        "cycle_count": "Cycle count once a month",
+        "csl_policy": "Medium CSL: 85%–90%",
+        "description": "Intermediate items: Moderate dollar volume or moderate frequency. Monthly cycle counts and standard buffer.",
+    },
+    "C": {
+        "cycle_count": "Cycle count once a year",
+        "csl_policy": "Low CSL: 70%–80%",
+        "description": "Low-velocity items: Infrequent transactions or low dollar volume. Annual physical count.",
+    },
+    "D": {
+        "cycle_count": "Do not count",
+        "csl_policy": "No safety stock; donate, destroy, or discount",
+        "description": "Obsolete, zero-demand, or dead stock ($0 sales or 0 hits). Liquidation or disposition recommended.",
+    },
+}
+
+RANK_TO_SCORE: Dict[str, int] = {"A": 4, "B": 3, "C": 2, "D": 1}
+SCORE_TO_RANK: Dict[int, str] = {4: "A", 3: "B", 2: "C", 1: "D"}
+
+MULTICRITERIA_MATRIX_MAP: Dict[Tuple[str, str], str] = {
+    # Class A: AA, AB, BA
+    ("A", "A"): "A",
+    ("A", "B"): "A",
+    ("B", "A"): "A",
+    # Class B: BB, AC, CA
+    ("B", "B"): "B",
+    ("A", "C"): "B",
+    ("C", "A"): "B",
+    # Class C: BC, CB
+    ("B", "C"): "C",
+    ("C", "B"): "C",
+    # Class D: CC, or any item with D in either Sales or Hits ($0 sales or 0 hits)
+    ("C", "C"): "D",
+    ("A", "D"): "D",
+    ("B", "D"): "D",
+    ("C", "D"): "D",
+    ("D", "D"): "D",
+    ("D", "A"): "D",
+    ("D", "B"): "D",
+    ("D", "C"): "D",
+}
+
+
+def map_multicriteria_class(sales_class: str, hits_class: str) -> str:
+    """
+    Map (Sales Class, Hits Class) to final Multicriteria Class:
+    Class A: AA, AB, BA
+    Class B: BB, AC, CA
+    Class C: BC, CB
+    Class D: CC, or any item with D in either Sales or Hits ($0 sales or 0 hits)
+    """
+    s = str(sales_class).strip().upper()
+    h = str(hits_class).strip().upper()
+    if s == "D" or h == "D":
+        return "D"
+    return MULTICRITERIA_MATRIX_MAP.get((s, h), "D")
+
+
+def calculate_weighted_score(
+    sales_score: int,
+    hits_score: int,
+    sales_weight: float = 0.65,
+    hits_weight: float = 0.35,
+) -> float:
+    """
+    Compute Combined Weighted Score = (Sales_Weight * Sales_Score) + (Hits_Weight * Hits_Score).
+    Default weights: 0.65 for Sales ($) and 0.35 for Hits (per Inventory_Classification_Methodology.pdf).
+    Rounded to 6 decimal places to prevent floating-point drift.
+    """
+    return round(float(sales_weight) * float(sales_score) + float(hits_weight) * float(hits_score), 6)
+
+
+def score_to_final_class(
+    score: float,
+    threshold_mode: str = "methodology",
+    custom_thresholds: Optional[Tuple[float, float, float]] = None,
+) -> str:
+    """
+    Assign Final Inventory Class from Combined Weighted Score.
+    Exact thresholds per Inventory_Classification_Methodology.pdf:
+    - Class A: Score >= 3.25 (4.00 – 3.25)
+    - Class B: Score >= 2.50 (3.24 – 2.50)
+    - Class C: Score >= 1.75 (2.49 – 1.75)
+    - Class D: Score < 1.75
+    Scores are rounded to 6 decimal places to prevent floating-point drift.
+
+    Supports:
+    - "methodology" (Default) or "equal_quarter": (3.25, 2.50, 1.75)
+    - "alternate": (3.40, 2.80, 2.10)
+    - "equal_quarter_legacy": (3.26, 2.51, 1.76)
+    - custom_thresholds: (t_a, t_b, t_c)
+    """
+    if custom_thresholds:
+        t_a, t_b, t_c = custom_thresholds
+    elif threshold_mode == "alternate":
+        t_a, t_b, t_c = 3.40, 2.80, 2.10
+    elif threshold_mode == "equal_quarter_legacy":
+        t_a, t_b, t_c = 3.26, 2.51, 1.76
+    else:  # "methodology", "equal_quarter", or default
+        t_a, t_b, t_c = 3.25, 2.50, 1.75
+
+    s = round(float(score), 6)
+    if s >= t_a:
+        return "A"
+    elif s >= t_b:
+        return "B"
+    elif s >= t_c:
+        return "C"
+    else:
+        return "D"
+
+
+def assign_criterion_ranks_and_cum(
+    values: List[float],
+) -> Tuple[List[float], List[str], List[int]]:
+    """
+    Computes cumulative share (Cum / Total) and assigns individual criterion rank
+    using the course brackets:
+    - A: cumulative share < 0.60
+    - B: 0.60 <= cumulative share < 0.80
+    - C: 0.80 <= cumulative share < 0.90
+    - D: cumulative share >= 0.90 (or $0 sales / 0 hits)
+
+    Sorted descending, preserving original row order on ties:
+    pos_items.sort(key=lambda x: (-x[1], x[0]))
+
+    Returns:
+        (cum_shares, ranks, scores) in the original input order.
+    """
+    n = len(values)
+    cum_shares = [1.0] * n
+    ranks = ["D"] * n
+    scores = [1] * n
+
+    # Filter positive items with their original index
+    pos_items = [(i, values[i]) for i in range(n) if values[i] > 0.0]
+    # Sort descending by value, preserving original row order on ties
+    pos_items.sort(key=lambda x: (-x[1], x[0]))
+
+    total_val = sum(v for _, v in pos_items)
+    if total_val <= 0.0:
+        return cum_shares, ranks, scores
+
+    running_cum = 0.0
+    for order_idx, (orig_idx, val) in enumerate(pos_items):
+        running_cum += val
+        cum_share = running_cum / total_val
+        cum_shares[orig_idx] = cum_share
+        if cum_share < 0.60 or order_idx == 0:
+            rank = "A"
+        elif cum_share < 0.80:
+            rank = "B"
+        elif cum_share < 0.90:
+            rank = "C"
+        else:
+            rank = "D"
+        ranks[orig_idx] = rank
+        scores[orig_idx] = RANK_TO_SCORE[rank]
+
+    # Non-positive values (<= 0) are assigned D, score 1, cum_share 1.0
+    for i in range(n):
+        if values[i] <= 0.0:
+            cum_shares[i] = 1.0
+            ranks[i] = "D"
+            scores[i] = 1
+
+    return cum_shares, ranks, scores
+
+
+@dataclass
+class ClassSummary:
+    class_label: str
+    item_count: int
+    item_pct: float
+    total_sales: float
+    sales_pct: float
+    total_hits: float
+    hits_pct: float
+    cycle_count_policy: str
+    csl_policy: str
+    description: str
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
+class MulticriteriaClassificationResult:
+    enriched_df: Any
+    class_summaries: Dict[str, ClassSummary]
+    total_items: int
+    total_sales: float
+    total_hits: float
+    summary_table: List[Dict[str, Any]]
+    sales_weight: float = 0.65
+    hits_weight: float = 0.35
+    threshold_mode: str = "methodology"
+    thresholds: Tuple[float, float, float] = (3.25, 2.50, 1.75)
+    required_summary: List[Dict[str, Any]] = field(default_factory=list)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "total_items": self.total_items,
+            "total_sales": self.total_sales,
+            "total_hits": self.total_hits,
+            "sales_weight": self.sales_weight,
+            "hits_weight": self.hits_weight,
+            "threshold_mode": self.threshold_mode,
+            "thresholds": list(self.thresholds),
+            "class_summaries": {k: v.to_dict() for k, v in self.class_summaries.items()},
+            "summary_table": self.summary_table,
+            "required_summary": self.required_summary,
+        }
+
+
+def _clean_numeric_val(val: Any) -> float:
+    """Strip currency symbols ($), commas (,), and whitespace from numeric values."""
+    if val is None:
+        return 0.0
+    if isinstance(val, (int, float)):
+        if math.isnan(val):
+            return 0.0
+        return float(val)
+    if isinstance(val, str):
+        cleaned = re.sub(r"[\$,\s]", "", val.strip())
+        try:
+            return float(cleaned)
+        except ValueError:
+            return 0.0
+    return 0.0
+
+
+def _classify_pareto_prior(
+    values: List[float],
+    threshold_a: float = 0.80,
+    threshold_b: float = 0.95,
+) -> List[str]:
+    """
+    Legacy helper: Assigns Pareto classes based on prior cumulative percentage.
+    Provided for backwards-compatibility.
+    """
+    n = len(values)
+    classes = ["D"] * n
+
+    positive_items = [(i, values[i]) for i in range(n) if values[i] > 0.0]
+    positive_items.sort(key=lambda x: x[1], reverse=True)
+
+    total_positive = sum(v for _, v in positive_items)
+    if total_positive <= 0.0:
+        return classes
+
+    running_sum = 0.0
+    for idx, val in positive_items:
+        prior_cum_pct = running_sum / total_positive
+        if prior_cum_pct < threshold_a:
+            classes[idx] = "A"
+        elif prior_cum_pct < threshold_b:
+            classes[idx] = "B"
+        else:
+            classes[idx] = "C"
+        running_sum += val
+
+    return classes
+
+
+def perform_multicriteria_classification(
+    df: Any,
+    sales_col: Optional[str] = None,
+    hits_col: Optional[str] = None,
+    sales_weight: float = 0.65,
+    hits_weight: float = 0.35,
+    threshold_mode: str = "methodology",
+    custom_thresholds: Optional[Tuple[float, float, float]] = None,
+    # Compatibility arguments:
+    threshold_a: Optional[float] = None,
+    threshold_b: Optional[float] = None,
+) -> MulticriteriaClassificationResult:
+    """
+    Perform Multicriteria Inventory Classification using the exact weighted-score
+    stratification methodology from Inventory_Classification_Methodology.pdf and course workbook.
+
+    Procedure:
+    1. Parse numeric Sales ($) and Hits (stripping currency $ and formatting commas).
+    2. For Sales ($) (sorted descending, preserving original row order on ties): compute
+       cumulative sales (Cum) and cumulative share (Cum / Total_Sales), then assign individual Sales_Rank:
+       - A: cumulative share < 0.60
+       - B: 0.60 <= cumulative share < 0.80
+       - C: 0.80 <= cumulative share < 0.90
+       - D: cumulative share >= 0.90 (or $0 sales)
+    3. For Hits (sorted descending, preserving original row order on ties): compute
+       cumulative hits (Cum) and cumulative share (Cum / Total_Hits), then assign individual Hits_Rank using
+       the exact same brackets:
+       - < 0.60 = A
+       - < 0.80 = B
+       - < 0.90 = C
+       - >= 0.90 = D (or 0 hits)
+    4. Rank-to-Score Conversion & Weighted Multicriteria Score:
+       Convert each criterion rank into numeric points: A = 4, B = 3, C = 2, D = 1.
+       Combined_Weighted_Score = (Sales_Weight * Sales_Score) + (Hits_Weight * Hits_Score)
+       Default weights: 0.65 Sales ($) and 0.35 Hits.
+    5. Final Multicriteria Class (A, B, C, D) & Module 3 Policies:
+       Assign Final_Class from Weighted_Score using methodology thresholds:
+       - Class A: Score >= 3.25 (4.00 – 3.25)
+       - Class B: Score >= 2.50 (3.24 – 2.50)
+       - Class C: Score >= 1.75 (2.49 – 1.75)
+       - Class D: Score < 1.75
+       (Rounded to 6 decimal places to avoid floating-point drift).
+    6. Attach Sales_Cum_Pct, Sales_Rank, Hits_Cum_Pct, Hits_Rank, Sales_Score, Hits_Score,
+       Weighted_Score (Combined_Weighted_Score), Final_Class (Final_Inventory_Class),
+       Cycle_Count_Policy, and Safety_Stock_CSL_Policy.
+    7. Generate Required Classification Summary Table:
+       Final Class (A, B, C, D), Number of Items, Total Sales ($) formatted with commas and $.
+    """
+    import copy
+
+    # Determine column names
+    col_names = list(df.columns) if hasattr(df, "columns") else []
+    if hasattr(df, "to_dict"):
+        records = df.to_dict("records")
+    elif isinstance(df, list):
+        records = copy.deepcopy(df)
+        if records and isinstance(records[0], dict) and not col_names:
+            col_names = list(records[0].keys())
+    elif isinstance(df, dict):
+        if not col_names:
+            col_names = list(df.keys())
+        n_rows = len(next(iter(df.values()))) if df else 0
+        records = [{c: df[c][i] for c in col_names} for i in range(n_rows)]
+    else:
+        raise ValueError("Unsupported DataFrame type for multicriteria classification.")
+
+    if not records:
+        raise ValueError("The provided inventory dataset is empty.")
+
+    # Find sales and hits columns if not specified
+    actual_sales_col = sales_col
+    actual_hits_col = hits_col
+
+    if not actual_sales_col or actual_sales_col not in col_names:
+        for c in col_names:
+            norm = re.sub(r"[_\s\-]+", "_", str(c).strip().lower())
+            norm_no_sym = re.sub(r"[\$\(\)]", "", norm).strip("_")
+            if norm in ["sales", "sales_($)", "sales_$", "sales_dollar", "annual_sales", "revenue", "dollar_sales"] or \
+               norm_no_sym in ["sales", "annual_sales", "revenue", "dollar_sales", "total_sales", "sales_usd"]:
+                actual_sales_col = c
+                break
+
+    if not actual_hits_col or actual_hits_col not in col_names:
+        for c in col_names:
+            norm = re.sub(r"[_\s\-]+", "_", str(c).strip().lower())
+            norm_no_sym = re.sub(r"[\$\(\)]", "", norm).strip("_")
+            if norm in ["hits", "picks", "pick_count", "frequency", "order_frequency", "hit_count", "annual_hits"] or \
+               norm_no_sym in ["hits", "picks", "pick_count", "frequency", "hit_count", "annual_hits"]:
+                actual_hits_col = c
+                break
+
+    if not actual_sales_col or not actual_hits_col:
+        raise ValueError(
+            f"Could not identify Sales and Hits columns in dataset. "
+            f"Available columns: {', '.join(col_names)}. "
+            f"Expected 'Sales ($)' and 'Hits' (or common synonyms)."
+        )
+
+    # Extract and clean numeric values
+    sales_values = [_clean_numeric_val(r.get(actual_sales_col)) for r in records]
+    hits_values = [_clean_numeric_val(r.get(actual_hits_col)) for r in records]
+
+    # Individual Criterion Ranking using course workbook brackets
+    sales_cum, sales_ranks, sales_scores = assign_criterion_ranks_and_cum(sales_values)
+    hits_cum, hits_ranks, hits_scores = assign_criterion_ranks_and_cum(hits_values)
+
+    # Weighted Multicriteria Score
+    w_sales = float(sales_weight)
+    w_hits = float(hits_weight)
+    # Ensure weights sum to 1.0 (normalize if not close to 1.0)
+    w_sum = w_sales + w_hits
+    if abs(w_sum - 1.0) > 1e-4 and w_sum > 0:
+        w_sales = w_sales / w_sum
+        w_hits = w_hits / w_sum
+
+    weighted_scores = [calculate_weighted_score(s, h, w_sales, w_hits) for s, h in zip(sales_scores, hits_scores)]
+
+    # Final Multicriteria Class
+    active_thresholds = custom_thresholds
+    if active_thresholds is None:
+        if threshold_mode == "alternate":
+            active_thresholds = (3.40, 2.80, 2.10)
+        elif threshold_mode == "equal_quarter_legacy":
+            active_thresholds = (3.26, 2.51, 1.76)
+        else:
+            active_thresholds = (3.25, 2.50, 1.75)
+
+    final_classes = [
+        score_to_final_class(ws, threshold_mode=threshold_mode, custom_thresholds=active_thresholds)
+        for ws in weighted_scores
+    ]
+
+    cycle_counts = [MODULE_3_POLICIES[c]["cycle_count"] for c in final_classes]
+    csl_policies = [MODULE_3_POLICIES[c]["csl_policy"] for c in final_classes]
+
+    # Attach to records
+    for i, r in enumerate(records):
+        r["Sales_Cum_Pct"] = sales_cum[i]
+        r["Sales_Rank"] = sales_ranks[i]
+        r["Hits_Cum_Pct"] = hits_cum[i]
+        r["Hits_Rank"] = hits_ranks[i]
+        r["Sales_Score"] = sales_scores[i]
+        r["Hits_Score"] = hits_scores[i]
+        r["Weighted_Score"] = weighted_scores[i]
+        r["Combined_Weighted_Score"] = weighted_scores[i]
+        r["Final_Class"] = final_classes[i]
+        r["Final_Inventory_Class"] = final_classes[i]
+        r["Cycle_Count_Policy"] = cycle_counts[i]
+        r["Safety_Stock_CSL_Policy"] = csl_policies[i]
+        # Backwards compatibility aliases
+        r["Sales_Class"] = sales_ranks[i]
+        r["Hits_Class"] = hits_ranks[i]
+        r["Multicriteria_Class"] = final_classes[i]
+        r["Recommended_Cycle_Count"] = cycle_counts[i]
+        r["Recommended_CSL_Policy"] = csl_policies[i]
+
+    # Attach to original/enriched df if pandas or SimpleDataFrame
+    if hasattr(df, "__setitem__"):
+        try:
+            df["Sales_Cum_Pct"] = sales_cum
+            df["Sales_Rank"] = sales_ranks
+            df["Hits_Cum_Pct"] = hits_cum
+            df["Hits_Rank"] = hits_ranks
+            df["Sales_Score"] = sales_scores
+            df["Hits_Score"] = hits_scores
+            df["Weighted_Score"] = weighted_scores
+            df["Combined_Weighted_Score"] = weighted_scores
+            df["Final_Class"] = final_classes
+            df["Final_Inventory_Class"] = final_classes
+            df["Cycle_Count_Policy"] = cycle_counts
+            df["Safety_Stock_CSL_Policy"] = csl_policies
+            # Aliases
+            df["Sales_Class"] = sales_ranks
+            df["Hits_Class"] = hits_ranks
+            df["Multicriteria_Class"] = final_classes
+            df["Recommended_Cycle_Count"] = cycle_counts
+            df["Recommended_CSL_Policy"] = csl_policies
+            enriched_df = df
+        except Exception:
+            enriched_df = records
+    else:
+        enriched_df = records
+
+    # Aggregate summaries across Final_Class
+    total_items = len(records)
+    total_sales = sum(sales_values)
+    total_hits = sum(hits_values)
+
+    class_summaries: Dict[str, ClassSummary] = {}
+    summary_table: List[Dict[str, Any]] = []
+    required_summary: List[Dict[str, Any]] = []
+
+    for cls_label in ["A", "B", "C", "D"]:
+        cls_count = sum(1 for c in final_classes if c == cls_label)
+        cls_sales = sum(s for s, c in zip(sales_values, final_classes) if c == cls_label)
+        cls_hits = sum(h for h, c in zip(hits_values, final_classes) if c == cls_label)
+
+        item_pct = (cls_count / total_items * 100.0) if total_items > 0 else 0.0
+        sales_pct = (cls_sales / total_sales * 100.0) if total_sales > 0 else 0.0
+        hits_pct = (cls_hits / total_hits * 100.0) if total_hits > 0 else 0.0
+
+        policy_info = MODULE_3_POLICIES[cls_label]
+        summary_obj = ClassSummary(
+            class_label=cls_label,
+            item_count=cls_count,
+            item_pct=item_pct,
+            total_sales=cls_sales,
+            sales_pct=sales_pct,
+            total_hits=cls_hits,
+            hits_pct=hits_pct,
+            cycle_count_policy=policy_info["cycle_count"],
+            csl_policy=policy_info["csl_policy"],
+            description=policy_info["description"],
+        )
+        class_summaries[cls_label] = summary_obj
+
+        # Required Classification Summary (Final Class, Number of Items, Total Sales ($))
+        required_summary.append({
+            "Final Class": f"Class {cls_label}",
+            "Number of Items": cls_count,
+            "Total Sales ($)": f"${cls_sales:,.2f}",
+        })
+
+        summary_table.append({
+            "Class": f"Class {cls_label}",
+            "SKU Count": f"{cls_count:,d}",
+            "% of SKUs": f"{item_pct:.1f}%",
+            "Total Sales ($)": f"${cls_sales:,.2f}",
+            "% of Sales": f"{sales_pct:.1f}%",
+            "Total Hits": f"{cls_hits:,.0f}",
+            "% of Hits": f"{hits_pct:.1f}%",
+            "Recommended Cycle Count": policy_info["cycle_count"],
+            "Recommended CSL Policy": policy_info["csl_policy"],
+        })
+
+    return MulticriteriaClassificationResult(
+        enriched_df=enriched_df,
+        class_summaries=class_summaries,
+        total_items=total_items,
+        total_sales=total_sales,
+        total_hits=total_hits,
+        summary_table=summary_table,
+        sales_weight=w_sales,
+        hits_weight=w_hits,
+        threshold_mode=threshold_mode,
+        thresholds=active_thresholds,
+        required_summary=required_summary,
+    )
+
+

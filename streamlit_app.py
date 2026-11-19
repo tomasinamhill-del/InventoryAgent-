@@ -313,6 +313,17 @@ from inventory_tools import (
     PeriodicReviewResult,
     NewsvendorResult,
     AnalystVerificationAudit,
+    perform_multicriteria_classification,
+    map_multicriteria_class,
+    MODULE_3_POLICIES,
+    MULTICRITERIA_MATRIX_MAP,
+    RANK_TO_SCORE,
+    SCORE_TO_RANK,
+    calculate_weighted_score,
+    score_to_final_class,
+    assign_criterion_ranks_and_cum,
+    ClassSummary,
+    MulticriteriaClassificationResult,
 )
 
 
@@ -510,14 +521,59 @@ Industrial Motor 5HP,Machinery,40,450.00
 PLC Control Unit,Machinery,75,220.00
 """
 
+SAMPLE_CLASSIFICATION_CSV = """Item Number,Item Name,UoM,Sales ($),Hits
+SKU-1001,Enterprise Server Rack,EA,"$125,000.00","1,450"
+SKU-1002,Optical Transceiver 100G,EA,"$65,000.00","2,800"
+SKU-1003,Managed Core Switch,EA,"$42,000.00","620"
+SKU-1004,Cat6A Patch Cable 2m,PK,"$18,000.00","3,100"
+SKU-1005,Fiber Optic Jumper,EA,"$14,500.00","1,950"
+SKU-1006,Rack Mount PDU,EA,"$9,800.00","410"
+SKU-1007,Grounding Busbar Kit,EA,"$8,000.00","180"
+SKU-1008,SFP Dust Covers,PK,"$6,000.00","1,100"
+SKU-1009,Patch Panel 24-Port,EA,"$3,000.00","110"
+SKU-1010,Velcro Cable Ties 100pk,PK,"$1,500.00","80"
+SKU-1011,Legacy Serial Adapter,EA,"$0.00","45"
+SKU-1012,Discontinued BNC Coupler,EA,"$0.00","0"
+"""
+
 
 def normalize_column_name(col: str) -> str:
     """
     Normalize column header string case-insensitively and map common inventory synonyms
-    to standard canonical attributes: product, category, units, unit_cost.
+    to standard canonical attributes.
+    Supports both valuation attributes (product, category, units, unit_cost)
+    and multicriteria classification attributes (item_number, item_name, uom, sales, hits).
     """
     cleaned = re.sub(r"[_\s\-]+", "_", col.strip().lower())
-    if cleaned in ["product", "product_name", "item", "item_name", "sku", "name", "part", "part_name"]:
+    cleaned_no_sym = re.sub(r"[\$\(\)]", "", cleaned).strip("_")
+
+    # Item Number
+    if cleaned in ["item_number", "item_no", "item_num", "item_#", "item_id", "part_number", "part_no", "item_code", "sku_number"] or \
+       cleaned_no_sym in ["item_number", "item_no", "item_num", "item_id", "part_number", "part_no", "item_code"]:
+        return "item_number"
+
+    # Item Name
+    if cleaned in ["item_name", "item_description", "item_desc", "description"] or \
+       cleaned_no_sym in ["item_name", "item_description", "item_desc", "description"]:
+        return "item_name"
+
+    # UoM (Unit of Measure)
+    if cleaned in ["uom", "unit_of_measure", "unit_of_measurement", "unit_measure", "measure", "u_o_m"] or \
+       cleaned_no_sym in ["uom", "unit_of_measure", "unit_of_measurement", "unit_measure", "measure"]:
+        return "uom"
+
+    # Sales ($)
+    if cleaned in ["sales", "sales_($)", "sales_$", "sales_dollar", "sales_dollars", "annual_sales", "revenue", "dollar_sales", "total_sales"] or \
+       cleaned_no_sym in ["sales", "sales_dollar", "sales_dollars", "annual_sales", "revenue", "dollar_sales", "total_sales", "sales_usd", "sales_value"]:
+        return "sales"
+
+    # Hits (Picks / Transaction frequency)
+    if cleaned in ["hits", "picks", "pick_count", "picks_count", "frequency", "order_frequency", "hit_count", "annual_hits", "total_hits", "order_lines"] or \
+       cleaned_no_sym in ["hits", "picks", "pick_count", "frequency", "hit_count", "annual_hits", "total_hits"]:
+        return "hits"
+
+    # Valuation attributes
+    if cleaned in ["product", "product_name", "item", "sku", "name", "part", "part_name"]:
         return "product"
     if cleaned in ["category", "cat", "department", "dept", "group", "class", "product_category"]:
         return "category"
@@ -525,6 +581,7 @@ def normalize_column_name(col: str) -> str:
         return "units"
     if cleaned in ["unit_cost", "cost", "unit_price", "price", "cost_per_unit", "unitcost", "cost_unit"]:
         return "unit_cost"
+
     return cleaned
 
 
@@ -553,10 +610,18 @@ def clean_numeric_series(series: Any) -> Any:
     return series
 
 
-def load_and_process_inventory_csv(file_or_content: Any) -> Tuple[Any, Any, Dict[str, Any]]:
+def load_and_process_inventory_csv(
+    file_or_content: Any,
+    sales_weight: float = 0.65,
+    hits_weight: float = 0.35,
+    threshold_mode: str = "methodology",
+    custom_thresholds: Optional[Tuple[float, float, float]] = None,
+) -> Tuple[Any, Any, Dict[str, Any]]:
     """
     Load an inventory CSV into a DataFrame, validate expected columns case-insensitively,
-    and compute the inventory_value column (units * unit_cost).
+    and process either:
+    1. Multicriteria Inventory Classification (Sales and Hits weighted score stratification), and/or
+    2. Catalog Valuation Analytics (units, unit_cost, inventory_value = units * unit_cost).
 
     Returns:
         (processed_df, original_df, dataset_summary)
@@ -591,46 +656,89 @@ def load_and_process_inventory_csv(file_or_content: Any) -> Tuple[Any, Any, Dict
     col_mapping = {}
     for c in raw_columns:
         norm = normalize_column_name(str(c))
-        if norm in ["product", "category", "units", "unit_cost"] and norm not in col_mapping.values():
+        if norm not in col_mapping.values():
             col_mapping[c] = norm
 
-    required_targets = ["product", "category", "units", "unit_cost"]
-    missing = [target for target in required_targets if target not in col_mapping.values()]
-    if missing:
+    has_classification = ("sales" in col_mapping.values() and "hits" in col_mapping.values())
+    has_valuation = ("units" in col_mapping.values() and "unit_cost" in col_mapping.values())
+
+    # Check validation requirements
+    if not has_classification and not has_valuation:
+        required_targets = ["product", "category", "units", "unit_cost"]
+        missing = [target for target in required_targets if target not in col_mapping.values()]
         raise ValueError(
             f"Missing required inventory column(s): {', '.join(missing)}. "
             f"Expected columns: product, category, units, unit_cost (handled case-insensitively). "
             f"Columns detected in CSV: {', '.join(raw_columns)}."
         )
 
+    # For valuation files lacking category, raise validation error
+    if has_valuation and not has_classification:
+        if "category" not in col_mapping.values():
+            raise ValueError(
+                f"Missing required inventory column(s): category. "
+                f"Expected columns: product, category, units, unit_cost (handled case-insensitively). "
+                f"Columns detected in CSV: {', '.join(raw_columns)}."
+            )
+
     processed_df = original_df.copy()
-    if hasattr(processed_df, "rename"):
-        processed_df = processed_df.rename(columns=col_mapping)
-    else:
-        for old_col, new_col in col_mapping.items():
-            processed_df[new_col] = processed_df[old_col]
 
-    # Clean and convert numeric columns: strip currency ($), commas (,), and whitespace
-    # before calling pd.to_numeric(..., errors="coerce") so formatted prices and counts
-    # like "$2.50", "$1,250.00", or "1,000" parse accurately instead of coercing to 0.0.
-    cleaned_units = clean_numeric_series(processed_df["units"])
-    processed_df["units"] = pd.to_numeric(cleaned_units, errors="coerce")
-    if hasattr(processed_df["units"], "fillna"):
-        processed_df["units"] = processed_df["units"].fillna(0)
+    classification_result = None
+    if has_classification:
+        sales_col_orig = next(k for k, v in col_mapping.items() if v == "sales")
+        hits_col_orig = next(k for k, v in col_mapping.items() if v == "hits")
+        classification_result = perform_multicriteria_classification(
+            processed_df,
+            sales_col=sales_col_orig,
+            hits_col=hits_col_orig,
+            sales_weight=sales_weight,
+            hits_weight=hits_weight,
+            threshold_mode=threshold_mode,
+            custom_thresholds=custom_thresholds,
+        )
+        processed_df = classification_result.enriched_df
 
-    cleaned_cost = clean_numeric_series(processed_df["unit_cost"])
-    processed_df["unit_cost"] = pd.to_numeric(cleaned_cost, errors="coerce")
-    if hasattr(processed_df["unit_cost"], "fillna"):
-        processed_df["unit_cost"] = processed_df["unit_cost"].fillna(0.0)
+    if has_valuation:
+        # If product is missing from col_mapping, look for item_name or item_number
+        if "product" not in col_mapping.values():
+            for k, v in list(col_mapping.items()):
+                if v in ["item_name", "item_number"]:
+                    col_mapping[k] = "product"
+                    break
 
-    # Calculate inventory_value = units * unit_cost
-    processed_df["inventory_value"] = processed_df["units"] * processed_df["unit_cost"]
+        units_col_orig = next(k for k, v in col_mapping.items() if v == "units")
+        cost_col_orig = next(k for k, v in col_mapping.items() if v == "unit_cost")
+
+        cleaned_units = clean_numeric_series(processed_df[units_col_orig])
+        processed_df["units"] = pd.to_numeric(cleaned_units, errors="coerce")
+        if hasattr(processed_df["units"], "fillna"):
+            processed_df["units"] = processed_df["units"].fillna(0)
+
+        cleaned_cost = clean_numeric_series(processed_df[cost_col_orig])
+        processed_df["unit_cost"] = pd.to_numeric(cleaned_cost, errors="coerce")
+        if hasattr(processed_df["unit_cost"], "fillna"):
+            processed_df["unit_cost"] = processed_df["unit_cost"].fillna(0.0)
+
+        processed_df["inventory_value"] = processed_df["units"] * processed_df["unit_cost"]
+
+        if "category" in col_mapping.values():
+            cat_col_orig = next(k for k, v in col_mapping.items() if v == "category")
+            if cat_col_orig != "category":
+                processed_df["category"] = processed_df[cat_col_orig]
+
+        if "product" in col_mapping.values():
+            prod_col_orig = next(k for k, v in col_mapping.items() if v == "product")
+            if prod_col_orig != "product":
+                processed_df["product"] = processed_df[prod_col_orig]
 
     summary = {
         "num_rows": int(len(original_df)),
         "num_columns": int(len(raw_columns)),
         "column_names": list(raw_columns),
         "mapped_columns": col_mapping,
+        "has_classification": has_classification,
+        "has_valuation": has_valuation,
+        "classification_result": classification_result,
     }
 
     return processed_df, original_df, summary
@@ -772,46 +880,61 @@ def compute_category_breakdown(df: Any) -> List[Dict[str, Any]]:
 def render_csv_analytics_dashboard():
     """
     Render the CSV Inventory Data Upload & Analytics Dashboard.
-    Displays:
-    - Dataset summary (rows, columns, column names) & original data table
-    - Key dashboard metrics: total units, average unit cost, product with highest units,
-      highest unit cost, and total inventory value across all products.
-    - Enriched data table with calculated inventory_value (units * unit_cost).
-    - Category-level breakdown grouping total units and total inventory value by category.
+    Supports both:
+    1. Multicriteria Inventory Classification (Sales and Hits Pareto Matrix), and
+    2. Catalog Valuation Analytics (units, unit_cost, inventory_value = units * unit_cost).
     """
     st.markdown('<div class="section-header">📊 CSV Inventory Data Upload & Analytics Dashboard</div>', unsafe_allow_html=True)
     st.write(
-        "Upload your company's inventory dataset as a CSV file. The analytics engine validates expected columns "
-        "(`product`, `category`, `units`, and `unit_cost`, handled case-insensitively), calculates total "
-        "holding valuation per product (`units * unit_cost`), surfaces aggregate KPI metrics, and generates category-level breakdowns."
+        "Upload your company's inventory dataset as a CSV file. The engine supports **Multicriteria Inventory Classification** "
+        "(Pareto matrix on `Sales ($)` and `Hits`), and **Catalog Valuation Analytics** (`units` and `unit_cost`), "
+        "automatically detecting column schemas case-insensitively."
     )
 
-    col_up1, col_up2 = st.columns([3, 1.2])
+    col_up1, col_up2 = st.columns([3, 1.4])
     with col_up1:
         uploaded_file = st.file_uploader(
             "📂 Choose an Inventory CSV file:",
             type=["csv"],
-            help="Expected columns: product, category, units, unit_cost (case-insensitive)",
+            help="Expected columns: Classification (Item Number, Item Name, UoM, Sales ($), Hits) or Valuation (product, category, units, unit_cost)",
             key="csv_file_uploader",
         )
     with col_up2:
-        st.markdown("**Quick Demo:**")
-        if st.button("📥 Load Sample CSV Data", help="Load sample 10-product catalog across 4 categories", use_container_width=True):
-            st.session_state["use_sample_csv"] = True
+        st.markdown("**Quick Demo Data:**")
+        qcol1, qcol2 = st.columns(2)
+        with qcol1:
+            if st.button("📊 Classification", help="Load 12-SKU classification sample with Sales ($) & Hits", use_container_width=True):
+                st.session_state["use_sample_csv"] = "classification"
+        with qcol2:
+            if st.button("💰 Valuation", help="Load 10-product catalog across 4 categories", use_container_width=True):
+                st.session_state["use_sample_csv"] = "valuation"
 
     csv_data_source = None
     if uploaded_file is not None:
         csv_data_source = uploaded_file
         st.session_state["use_sample_csv"] = False
-    elif st.session_state.get("use_sample_csv", False):
+    elif st.session_state.get("use_sample_csv") == "classification":
+        csv_data_source = io.StringIO(SAMPLE_CLASSIFICATION_CSV)
+    elif st.session_state.get("use_sample_csv") == "valuation" or st.session_state.get("use_sample_csv") is True:
         csv_data_source = io.StringIO(SAMPLE_INVENTORY_CSV)
 
     if csv_data_source is None:
-        st.info("👆 Please upload a CSV file or click '**📥 Load Sample CSV Data**' to view the analytics dashboard.")
-        with st.expander("ℹ️ Expected CSV Format & Column Synonyms Guide", expanded=True):
+        st.info("👆 Please upload a CSV file or click '**📊 Classification**' or '**💰 Valuation**' above to view the analytics dashboard.")
+        with st.expander("ℹ️ Expected CSV Formats & Column Synonyms Guide", expanded=True):
             st.markdown(
                 """
-                The uploaded CSV can use standard column names or common synonyms (matching is case-insensitive):
+                The uploaded CSV can contain either **Multicriteria Inventory Classification** data, **Catalog Valuation** data, or both (matching is case-insensitive):
+
+                #### 1. Multicriteria Classification Schema (Module 3 Pareto Matrix)
+                | Target Attribute | Supported Column Names (Case-Insensitive) | Description | Example |
+                | :--- | :--- | :--- | :--- |
+                | **Item Number** | `item_number`, `item_no`, `item_num`, `item_#`, `sku`, `part_number` | Unique item identifier / SKU | `SKU-1001` |
+                | **Item Name** | `item_name`, `product_name`, `description`, `item_desc`, `item_description` | Descriptive item title | `Enterprise Server Rack` |
+                | **UoM** | `uom`, `unit_of_measure`, `unit_of_measurement`, `unit_measure` | Unit of measure | `EA`, `PK`, `BOX` |
+                | **Sales ($)** | `sales`, `sales_($)`, `sales_dollar`, `annual_sales`, `revenue` | Annual sales dollar volume | `$125,000.00` |
+                | **Hits** | `hits`, `picks`, `frequency`, `order_frequency`, `hit_count` | Annual order lines / transactions | `1,450` |
+
+                #### 2. Holding Valuation Schema
                 | Target Attribute | Supported Column Names (Case-Insensitive) | Description | Example |
                 | :--- | :--- | :--- | :--- |
                 | **product** | `product`, `product_name`, `item`, `sku`, `name`, `part` | Product SKU or identifier | `Widget Alpha` |
@@ -824,8 +947,6 @@ def render_csv_analytics_dashboard():
 
     try:
         processed_df, original_df, summary = load_and_process_inventory_csv(csv_data_source)
-        metrics = compute_inventory_metrics(processed_df)
-        cat_breakdown = compute_category_breakdown(processed_df)
     except Exception as e:
         st.error(f"❌ **CSV Processing Error:** {str(e)}")
         return
@@ -836,12 +957,17 @@ def render_csv_analytics_dashboard():
 
     sum_cols = st.columns(3)
     with sum_cols[0]:
-        st.metric("Total Rows (Products)", f"{summary['num_rows']:,d}")
+        st.metric("Total Rows (Items)", f"{summary['num_rows']:,d}")
     with sum_cols[1]:
         st.metric("Total Columns", f"{summary['num_columns']:,d}")
     with sum_cols[2]:
-        mapped_count = len(summary["mapped_columns"])
-        st.metric("Required Columns", f"✓ {mapped_count} / 4 Mapped")
+        capabilities = []
+        if summary.get("has_classification"):
+            capabilities.append("Classification (Sales + Hits)")
+        if summary.get("has_valuation"):
+            capabilities.append("Valuation (Units + Cost)")
+        cap_str = " & ".join(capabilities) if capabilities else "Custom Schema"
+        st.metric("Dataset Capability", cap_str)
 
     st.markdown(
         f"**Original Column Names ({summary['num_columns']}):** " + ", ".join([f"`{col}`" for col in summary["column_names"]])
@@ -853,87 +979,300 @@ def render_csv_analytics_dashboard():
         else:
             st.dataframe(original_df, use_container_width=True)
 
-    # 2. Key Dashboard Metrics
-    st.markdown("---")
-    st.markdown("#### 2. 📈 Key Inventory Dashboard Metrics")
-    kpi_cols = st.columns(5)
-    with kpi_cols[0]:
-        st.metric(
-            label="Total Units",
-            value=f"{metrics['total_units']:,.0f}",
-            help="Total physical units across all products in inventory",
-        )
-    with kpi_cols[1]:
-        st.metric(
-            label="Average Unit Cost",
-            value=f"${metrics['average_unit_cost']:,.2f}",
-            help="Unweighted average procurement cost across all catalog SKUs",
-        )
-    with kpi_cols[2]:
-        st.metric(
-            label="Highest Stocked Product",
-            value=f"{metrics['highest_units_count']:,.0f} units",
-            delta=metrics["product_highest_units"],
-            delta_color="normal",
-            help="Product holding the highest physical unit volume",
-        )
-    with kpi_cols[3]:
-        st.metric(
-            label="Highest Unit Cost",
-            value=f"${metrics['highest_unit_cost']:,.2f}",
-            delta=metrics["product_highest_cost"],
-            delta_color="normal",
-            help="Highest single-unit purchase cost item",
-        )
-    with kpi_cols[4]:
-        st.metric(
-            label="Total Inventory Value",
-            value=f"${metrics['total_inventory_value']:,.2f}",
-            help="Total inventory asset valuation across all products: sum(units * unit_cost)",
+    # -------------------------------------------------------------------------
+    # Multicriteria Inventory Classification Section (Methodology Stratification)
+    # -------------------------------------------------------------------------
+    if summary.get("has_classification"):
+        st.markdown("---")
+        st.markdown("#### 2. 📦 Multicriteria Inventory Classification (Methodology Stratification)")
+        st.caption(
+            "Bivariate inventory classification based on **Sales ($)** (annual dollar volume) and **Hits** "
+            "(order line pick frequency) using the exact weighted-score stratification methodology from "
+            "`Inventory_Classification_Methodology.pdf`."
         )
 
-    # 3. Calculated inventory_value Column & Enriched Data Table
-    st.markdown("---")
-    st.markdown("#### 3. 💰 Enriched Inventory Data Table (`inventory_value = units * unit_cost`)")
-    st.caption("Each line item displays the deterministic inventory valuation calculated from physical stock and unit cost:")
+        # Interactive Tuning: Weights and Threshold Set Selection
+        st.markdown("##### ⚙️ Multicriteria Weights & Classification Threshold Tuning")
+        ctl_cols = st.columns([2.5, 2.5])
+        with ctl_cols[0]:
+            sales_w = st.slider(
+                "Sales ($) Weight:",
+                min_value=0.0,
+                max_value=1.0,
+                value=float(st.session_state.get("sales_weight_val", 0.65)),
+                step=0.05,
+                help="Relative weight of Sales ($) score in the weighted score formula (Default: 0.65 per methodology)",
+                key="sales_weight_slider",
+            )
+            hits_w = round(1.0 - sales_w, 2)
+            st.session_state["sales_weight_val"] = sales_w
+            st.markdown(f"**Hits Weight:** `{hits_w:.2f}` *(automatically constrained: Sales Weight + Hits Weight = 1.00)*")
+            st.caption(f"**Combined Weighted Score Formula:** `({sales_w:.2f} × Sales_Score) + ({hits_w:.2f} × Hits_Score)`")
 
-    table_records = []
-    for r in processed_df.to_dict("records"):
-        formatted_row = dict(r)
-        formatted_row["units"] = f"{float(r['units']):,.0f}"
-        formatted_row["unit_cost"] = f"${float(r['unit_cost']):,.2f}"
-        formatted_row["inventory_value"] = f"${float(r['inventory_value']):,.2f}"
-        table_records.append(formatted_row)
+        with ctl_cols[1]:
+            scale_choice = st.radio(
+                "Classification Scale Thresholds:",
+                options=[
+                    "Methodology Thresholds (>= 3.25 A, >= 2.50 B, >= 1.75 C, < 1.75 D) [Default]",
+                    "Alternate Scale (>= 3.40 A, >= 2.80 B, >= 2.10 C, < 2.10 D)",
+                ],
+                index=0 if st.session_state.get("strat_scale_choice", "methodology") == "methodology" else 1,
+                help="Select threshold scale (Methodology thresholds >= 3.25 / 2.50 / 1.75 vs Alternate)",
+                key="strat_threshold_radio",
+            )
+            thresh_mode = "methodology" if "Methodology" in scale_choice else "alternate"
+            st.session_state["strat_scale_choice"] = thresh_mode
 
-    st.dataframe(table_records, use_container_width=True)
+        # Re-run classification with active weights and threshold mode
+        sales_col_orig = next(k for k, v in summary["mapped_columns"].items() if v == "sales")
+        hits_col_orig = next(k for k, v in summary["mapped_columns"].items() if v == "hits")
+        class_res: MulticriteriaClassificationResult = perform_multicriteria_classification(
+            processed_df,
+            sales_col=sales_col_orig,
+            hits_col=hits_col_orig,
+            sales_weight=sales_w,
+            hits_weight=hits_w,
+            threshold_mode=thresh_mode,
+        )
+        processed_df = class_res.enriched_df
+        cs = class_res.class_summaries
 
-    # Download button for enriched CSV
-    enriched_csv_str = processed_df.to_csv(index=False) if hasattr(processed_df, "to_csv") else ""
-    if enriched_csv_str:
-        st.download_button(
-            label="📥 Download Enriched Inventory CSV",
-            data=enriched_csv_str,
-            file_name="enriched_inventory_with_values.csv",
-            mime="text/csv",
+        # Required Classification Summary Table
+        st.markdown("##### 📋 Required Classification Summary")
+        st.caption(
+            "Distribution of inventory items and total annual sales volume across Final Inventory Classes (A, B, C, D):"
+        )
+        st.table(class_res.required_summary)
+
+        # 4 Summary Cards: Class A, B, C, D
+        st.markdown("##### 📊 Stratified Portfolio Summary Cards")
+        card_cols = st.columns(4)
+
+        with card_cols[0]:
+            st.markdown("##### 🌟 Class A (Top Priority)")
+            st.metric(
+                label="Class A SKUs",
+                value=f"{cs['A'].item_count:,d}",
+                delta=f"{cs['A'].item_pct:.1f}% of catalog",
+                delta_color="normal",
+            )
+            st.markdown(f"**Sales ($):** ${cs['A'].total_sales:,.2f} ({cs['A'].sales_pct:.1f}%)")
+            st.markdown(f"**Hits / Picks:** {cs['A'].total_hits:,.0f} ({cs['A'].hits_pct:.1f}%)")
+            st.info(f"**Cycle Count:** {cs['A'].cycle_count_policy}\n\n**CSL Policy:** {cs['A'].csl_policy}")
+
+        with card_cols[1]:
+            st.markdown("##### 🔷 Class B (Intermediate)")
+            st.metric(
+                label="Class B SKUs",
+                value=f"{cs['B'].item_count:,d}",
+                delta=f"{cs['B'].item_pct:.1f}% of catalog",
+                delta_color="normal",
+            )
+            st.markdown(f"**Sales ($):** ${cs['B'].total_sales:,.2f} ({cs['B'].sales_pct:.1f}%)")
+            st.markdown(f"**Hits / Picks:** {cs['B'].total_hits:,.0f} ({cs['B'].hits_pct:.1f}%)")
+            st.info(f"**Cycle Count:** {cs['B'].cycle_count_policy}\n\n**CSL Policy:** {cs['B'].csl_policy}")
+
+        with card_cols[2]:
+            st.markdown("##### 🔶 Class C (Low Velocity)")
+            st.metric(
+                label="Class C SKUs",
+                value=f"{cs['C'].item_count:,d}",
+                delta=f"{cs['C'].item_pct:.1f}% of catalog",
+                delta_color="normal",
+            )
+            st.markdown(f"**Sales ($):** ${cs['C'].total_sales:,.2f} ({cs['C'].sales_pct:.1f}%)")
+            st.markdown(f"**Hits / Picks:** {cs['C'].total_hits:,.0f} ({cs['C'].hits_pct:.1f}%)")
+            st.info(f"**Cycle Count:** {cs['C'].cycle_count_policy}\n\n**CSL Policy:** {cs['C'].csl_policy}")
+
+        with card_cols[3]:
+            st.markdown("##### 🛑 Class D (Dead Stock)")
+            st.metric(
+                label="Class D SKUs",
+                value=f"{cs['D'].item_count:,d}",
+                delta=f"{cs['D'].item_pct:.1f}% of catalog",
+                delta_color="inverse",
+            )
+            st.markdown(f"**Sales ($):** ${cs['D'].total_sales:,.2f} ({cs['D'].sales_pct:.1f}%)")
+            st.markdown(f"**Hits / Picks:** {cs['D'].total_hits:,.0f} ({cs['D'].hits_pct:.1f}%)")
+            st.warning(f"**Cycle Count:** {cs['D'].cycle_count_policy}\n\n**CSL Policy:** {cs['D'].csl_policy}")
+
+        # Module 3 Policy Reference Table
+        st.markdown("##### 📖 Module 3 Stratification Policies & Decision Reference Table")
+        t_a, t_b, t_c = class_res.thresholds
+        policy_table_data = [
+            {
+                "Multicriteria Class": "🌟 Class A",
+                "Weighted Score Bracket": f"Score ≥ {t_a:.2f}",
+                "Recommended Cycle Count": MODULE_3_POLICIES["A"]["cycle_count"],
+                "Safety Stock CSL Policy": MODULE_3_POLICIES["A"]["csl_policy"],
+                "Operational Focus / Strategy": MODULE_3_POLICIES["A"]["description"],
+            },
+            {
+                "Multicriteria Class": "🔷 Class B",
+                "Weighted Score Bracket": f"{t_b:.2f} ≤ Score < {t_a:.2f}",
+                "Recommended Cycle Count": MODULE_3_POLICIES["B"]["cycle_count"],
+                "Safety Stock CSL Policy": MODULE_3_POLICIES["B"]["csl_policy"],
+                "Operational Focus / Strategy": MODULE_3_POLICIES["B"]["description"],
+            },
+            {
+                "Multicriteria Class": "🔶 Class C",
+                "Weighted Score Bracket": f"{t_c:.2f} ≤ Score < {t_b:.2f}",
+                "Recommended Cycle Count": MODULE_3_POLICIES["C"]["cycle_count"],
+                "Safety Stock CSL Policy": MODULE_3_POLICIES["C"]["csl_policy"],
+                "Operational Focus / Strategy": MODULE_3_POLICIES["C"]["description"],
+            },
+            {
+                "Multicriteria Class": "🛑 Class D",
+                "Weighted Score Bracket": f"Score < {t_c:.2f} (or $0 / 0)",
+                "Recommended Cycle Count": MODULE_3_POLICIES["D"]["cycle_count"],
+                "Safety Stock CSL Policy": MODULE_3_POLICIES["D"]["csl_policy"],
+                "Operational Focus / Strategy": MODULE_3_POLICIES["D"]["description"],
+            },
+        ]
+        st.table(policy_table_data)
+
+        # Full Enriched Classification DataFrame
+        st.markdown("##### 📋 Full Enriched Multicriteria Classified Inventory Table")
+        st.caption(
+            "Every catalog item is enriched with cumulative share (Cum / Total), individual criterion ranks (< 0.60 A, < 0.80 B, < 0.90 C, >= 0.90 D), "
+            "numeric point scores (A=4, B=3, C=2, D=1), composite Weighted Score, Final Class, and Module 3 operational policies:"
         )
 
-    # 4. Category-Level Breakdown
-    st.markdown("---")
-    st.markdown("#### 4. 🏷️ Category-Level Breakdown")
-    st.caption("Portfolio distribution grouping total units and total inventory value by product category:")
+        class_table_records = []
+        for r in processed_df.to_dict("records"):
+            formatted_row = dict(r)
+            # Format sales, hits, and cumulative percentages
+            for k in formatted_row:
+                norm_k = normalize_column_name(str(k))
+                if norm_k == "sales":
+                    try:
+                        formatted_row[k] = f"${float(clean_numeric_series([formatted_row[k]])[0]):,.2f}"
+                    except Exception:
+                        pass
+                elif norm_k == "hits":
+                    try:
+                        formatted_row[k] = f"{float(clean_numeric_series([formatted_row[k]])[0]):,.0f}"
+                    except Exception:
+                        pass
 
-    cat_table_data = []
-    for c in cat_breakdown:
-        cat_table_data.append({
-            "Category": c["category"],
-            "Product Count": f"{c['product_count']:,d}",
-            "Total Units": f"{c['total_units']:,.0f}",
-            "Share of Units": f"{c['pct_of_total_units']:.1f}%",
-            "Total Inventory Value": f"${c['total_inventory_value']:,.2f}",
-            "Share of Value": f"{c['pct_of_total_value']:.1f}%",
-            "Avg Unit Cost": f"${c['avg_unit_cost']:,.2f}",
-        })
-    st.table(cat_table_data)
+            if "Sales_Cum_Pct" in formatted_row and formatted_row["Sales_Cum_Pct"] is not None:
+                formatted_row["Sales_Cum_Pct"] = f"{float(formatted_row['Sales_Cum_Pct']) * 100.0:.1f}%"
+            if "Hits_Cum_Pct" in formatted_row and formatted_row["Hits_Cum_Pct"] is not None:
+                formatted_row["Hits_Cum_Pct"] = f"{float(formatted_row['Hits_Cum_Pct']) * 100.0:.1f}%"
+            if "Weighted_Score" in formatted_row and formatted_row["Weighted_Score"] is not None:
+                formatted_row["Weighted_Score"] = f"{float(formatted_row['Weighted_Score']):.2f}"
+            if "Combined_Weighted_Score" in formatted_row and formatted_row["Combined_Weighted_Score"] is not None:
+                formatted_row["Combined_Weighted_Score"] = f"{float(formatted_row['Combined_Weighted_Score']):.2f}"
+
+            class_table_records.append(formatted_row)
+
+        st.dataframe(class_table_records, use_container_width=True)
+
+        # CSV Download Button for Classified CSV
+        classified_csv_str = processed_df.to_csv(index=False) if hasattr(processed_df, "to_csv") else ""
+        if classified_csv_str:
+            st.download_button(
+                label="📥 Download Classified Inventory CSV",
+                data=classified_csv_str,
+                file_name="classified_inventory_stratification.csv",
+                mime="text/csv",
+                key="download_classified_inventory_csv",
+            )
+
+    # -------------------------------------------------------------------------
+    # Catalog Valuation Analytics Section
+    # -------------------------------------------------------------------------
+    if summary.get("has_valuation"):
+        metrics = compute_inventory_metrics(processed_df)
+        cat_breakdown = compute_category_breakdown(processed_df)
+
+        sec_num = "3" if summary.get("has_classification") else "2"
+        st.markdown("---")
+        st.markdown(f"#### {sec_num}. 📈 Key Inventory Dashboard Valuation Metrics")
+        kpi_cols = st.columns(5)
+        with kpi_cols[0]:
+            st.metric(
+                label="Total Units",
+                value=f"{metrics['total_units']:,.0f}",
+                help="Total physical units across all products in inventory",
+            )
+        with kpi_cols[1]:
+            st.metric(
+                label="Average Unit Cost",
+                value=f"${metrics['average_unit_cost']:,.2f}",
+                help="Unweighted average procurement cost across all catalog SKUs",
+            )
+        with kpi_cols[2]:
+            st.metric(
+                label="Highest Stocked Product",
+                value=f"{metrics['highest_units_count']:,.0f} units",
+                delta=metrics["product_highest_units"],
+                delta_color="normal",
+                help="Product holding the highest physical unit volume",
+            )
+        with kpi_cols[3]:
+            st.metric(
+                label="Highest Unit Cost",
+                value=f"${metrics['highest_unit_cost']:,.2f}",
+                delta=metrics["product_highest_cost"],
+                delta_color="normal",
+                help="Highest single-unit purchase cost item",
+            )
+        with kpi_cols[4]:
+            st.metric(
+                label="Total Inventory Value",
+                value=f"${metrics['total_inventory_value']:,.2f}",
+                help="Total inventory asset valuation across all products: sum(units * unit_cost)",
+            )
+
+        # Calculated inventory_value Column & Enriched Data Table
+        sec_num_table = "4" if summary.get("has_classification") else "3"
+        st.markdown("---")
+        st.markdown(f"#### {sec_num_table}. 💰 Enriched Inventory Data Table (`inventory_value = units * unit_cost`)")
+        st.caption("Each line item displays the deterministic inventory valuation calculated from physical stock and unit cost:")
+
+        val_table_records = []
+        for r in processed_df.to_dict("records"):
+            formatted_row = dict(r)
+            if "units" in formatted_row and formatted_row["units"] is not None:
+                formatted_row["units"] = f"{float(formatted_row['units']):,.0f}"
+            if "unit_cost" in formatted_row and formatted_row["unit_cost"] is not None:
+                formatted_row["unit_cost"] = f"${float(formatted_row['unit_cost']):,.2f}"
+            if "inventory_value" in formatted_row and formatted_row["inventory_value"] is not None:
+                formatted_row["inventory_value"] = f"${float(formatted_row['inventory_value']):,.2f}"
+            val_table_records.append(formatted_row)
+
+        st.dataframe(val_table_records, use_container_width=True)
+
+        # Download button for valuation CSV
+        val_csv_str = processed_df.to_csv(index=False) if hasattr(processed_df, "to_csv") else ""
+        if val_csv_str:
+            st.download_button(
+                label="📥 Download Valuation Inventory CSV",
+                data=val_csv_str,
+                file_name="enriched_inventory_with_values.csv",
+                mime="text/csv",
+                key="download_valuation_csv",
+            )
+
+        # Category-Level Breakdown
+        sec_num_cat = "5" if summary.get("has_classification") else "4"
+        st.markdown("---")
+        st.markdown(f"#### {sec_num_cat}. 🏷️ Category-Level Breakdown")
+        st.caption("Portfolio distribution grouping total units and total inventory value by product category:")
+
+        cat_table_data = []
+        for c in cat_breakdown:
+            cat_table_data.append({
+                "Category": c["category"],
+                "Product Count": f"{c['product_count']:,d}",
+                "Total Units": f"{c['total_units']:,.0f}",
+                "Share of Units": f"{c['pct_of_total_units']:.1f}%",
+                "Total Inventory Value": f"${c['total_inventory_value']:,.2f}",
+                "Share of Value": f"{c['pct_of_total_value']:.1f}%",
+                "Avg Unit Cost": f"${c['avg_unit_cost']:,.2f}",
+            })
+        st.table(cat_table_data)
 
 
 # -----------------------------------------------------------------------------
