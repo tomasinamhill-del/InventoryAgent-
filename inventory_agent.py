@@ -286,44 +286,243 @@ class InventoryDecisionAgent:
         ]
         return self._extract_number(text, patterns)
 
-    def _extract_annual_demand(self, text: str) -> Optional[float]:
-        """Extracts annual / yearly demand rate."""
-        patterns = [
-            r"annual\s+demand\s*(?:is|of|=|:)?\s*([\d,]+(?:\.\d+)?)",
-            r"demand\s*(?:is|of|=|:)?\s*([\d,]+(?:\.\d+)?)\s*(?:units|items|cases|pieces)?\s*(?:per\s+year|annually|per\s+annum|\/year)",
-            r"([\d,]+(?:\.\d+)?)\s*(?:units|items|cases|pieces)?\s*(?:per\s+year|annually|per\s+annum|\/year)",
-            r"yearly\s+demand\s*(?:is|of|=|:)?\s*([\d,]+(?:\.\d+)?)",
-            r"annual\s+(?:usage|sales|requirement)\s*(?:is|of|=|:)?\s*([\d,]+(?:\.\d+)?)",
-            r"demand\s+(?:averages|is|of|=|:)\s*([\d,]+(?:\.\d+)?)\s*(?:units|items)?",
-        ]
-        return self._extract_number(text, patterns)
+    def _extract_demand_with_time_unit(self, text: str, default_work_days: int = 250) -> Dict[str, Any]:
+        """
+        Extracts demand rate and inspects associated time unit:
+        - month / monthly / /month -> converts to annual by multiplying by 12
+        - week / weekly / /week -> converts to annual by multiplying by 52 (or work_days / 5 if specified)
+        - day / daily / /day -> converts to annual by multiplying by work_days (default 250, or 365 for calendar days)
+        - quarter / quarterly / /quarter -> converts to annual by multiplying by 4
+        - year / annually / /year -> 1.0 multiplier
+        Returns:
+            Dict containing:
+            - annual_demand: float
+            - stated_demand: float
+            - stated_unit: str ('month', 'week', 'day', 'quarter', 'year')
+            - conversion_note: Optional[str] (e.g. '1,000 units/month × 12 = 12,000 units/year')
+            - multiplier: float
+            - work_days: int
+        """
+        # Determine operating / working days
+        if re.search(r"\b(calendar\s+days?|365\s*(?:days?|work\s*days?)|every\s+day\s+of\s+the\s+year|365\s*days?\s*per\s*year|seven\s+days\s+a\s+week|7\s*days\s*a\s*week)\b", text, re.IGNORECASE):
+            work_days = 365
+        else:
+            m_wd = re.search(r"(\d+)\s*(?:working\s+days|operating\s+days|work\s+days|business\s+days|days\s+per\s+year|days\s+a\s+year)\b", text, re.IGNORECASE)
+            work_days = int(m_wd.group(1)) if m_wd else default_work_days
 
-    def _extract_holding_cost(self, text: str) -> Tuple[Optional[float], Optional[float]]:
+        def clean_num(val_str: str) -> Optional[float]:
+            try:
+                return float(val_str.replace(",", "").strip())
+            except ValueError:
+                return None
+
+        def norm_unit(u_str: str) -> str:
+            u = u_str.lower().strip()
+            if any(w in u for w in ["month", "mo"]):
+                return "month"
+            if any(w in u for w in ["week", "wk"]):
+                return "week"
+            if any(w in u for w in ["day", "daily"]):
+                return "day"
+            if any(w in u for w in ["quarter", "qtr"]):
+                return "quarter"
+            if any(w in u for w in ["year", "annum", "annual", "yr"]):
+                return "year"
+            return "year"
+
+        def build_dict(val: float, unit: str, w_days: int) -> Dict[str, Any]:
+            val_disp = f"{val:,.0f}" if val.is_integer() else f"{val:,.2f}"
+            if unit == "month":
+                annual = val * 12.0
+                ann_disp = f"{annual:,.0f}" if annual.is_integer() else f"{annual:,.2f}"
+                note = f"{val_disp} units/month × 12 = {ann_disp} units/year"
+                multiplier = 12.0
+            elif unit == "week":
+                annual = val * 52.0
+                ann_disp = f"{annual:,.0f}" if annual.is_integer() else f"{annual:,.2f}"
+                note = f"{val_disp} units/week × 52 = {ann_disp} units/year"
+                multiplier = 52.0
+            elif unit == "day":
+                annual = val * float(w_days)
+                ann_disp = f"{annual:,.0f}" if annual.is_integer() else f"{annual:,.2f}"
+                day_type = "calendar days" if w_days == 365 else "work days"
+                note = f"{val_disp} units/day × {w_days} {day_type}/year = {ann_disp} units/year"
+                multiplier = float(w_days)
+            elif unit == "quarter":
+                annual = val * 4.0
+                ann_disp = f"{annual:,.0f}" if annual.is_integer() else f"{annual:,.2f}"
+                note = f"{val_disp} units/quarter × 4 = {ann_disp} units/year"
+                multiplier = 4.0
+            else:  # "year"
+                annual = val
+                note = None
+                multiplier = 1.0
+
+            return {
+                "annual_demand": annual,
+                "stated_demand": val,
+                "stated_unit": unit,
+                "conversion_note": note,
+                "multiplier": multiplier,
+                "work_days": w_days,
+            }
+
+        # 1. Prefix time unit: e.g. "monthly demand is 1,000", "daily demand of 50"
+        prefix_patterns = [
+            r"\b(annual|yearly|monthly|weekly|daily|quarterly)\s+(?:demand|usage|sales|requirement|consumption)\s*(?:is|of|=|:|\baverages\b)?\s*([\d,]+(?:\.\d+)?)",
+            r"\b(annual|yearly|monthly|weekly|daily|quarterly)\s+rate\s+of\s+(?:demand|usage|sales)\s*(?:is|of|=|:)?\s*([\d,]+(?:\.\d+)?)",
+        ]
+        for pat in prefix_patterns:
+            m = re.search(pat, text, re.IGNORECASE)
+            if m:
+                unit = norm_unit(m.group(1))
+                val = clean_num(m.group(2))
+                if val is not None and val > 0:
+                    return build_dict(val, unit, work_days)
+
+        # 2. Postfix time unit directly attached to demand:
+        postfix_patterns = [
+            r"(?:demand|usage|sales|requirement|consumption)\s*(?:is|of|=|:|\baverages\b)?\s*([\d,]+(?:\.\d+)?)\s*(?:units|items|cases|pieces|parts|boxes)?\s*(?:per\s+(?:year|annum|month|week|day|quarter)|\s*\/\s*(?:year|month|week|day|quarter|yr|mo|wk)|\b(?:a|each)\s+(?:year|month|week|day|quarter)\b|\b(?:annually|yearly|monthly|weekly|daily|quarterly)\b)",
+            r"([\d,]+(?:\.\d+)?)\s*(?:units|items|cases|pieces|parts|boxes)\s*(?:per\s+(?:year|annum|month|week|day|quarter)|\s*\/\s*(?:year|month|week|day|quarter|yr|mo|wk)|\b(?:a|each)\s+(?:year|month|week|day|quarter)\b|\b(?:annually|yearly|monthly|weekly|daily|quarterly)\b)",
+        ]
+        for pat in postfix_patterns:
+            m = re.search(pat, text, re.IGNORECASE)
+            if m:
+                matched_str = m.group(0)
+                val = clean_num(m.group(1))
+                unit = "year"
+                if re.search(r"per\s+month|\/month|\/mo|\b(?:a|each)\s+month\b|\bmonthly\b", matched_str, re.IGNORECASE):
+                    unit = "month"
+                elif re.search(r"per\s+week|\/week|\/wk|\b(?:a|each)\s+week\b|\bweekly\b", matched_str, re.IGNORECASE):
+                    unit = "week"
+                elif re.search(r"per\s+day|\/day|\b(?:a|each)\s+day\b|\bdaily\b", matched_str, re.IGNORECASE):
+                    unit = "day"
+                elif re.search(r"per\s+quarter|\/quarter|\/qtr|\b(?:a|each)\s+quarter\b|\bquarterly\b", matched_str, re.IGNORECASE):
+                    unit = "quarter"
+                elif re.search(r"per\s+(?:year|annum)|\/(?:year|yr)|\b(?:a|each)\s+year\b|\b(?:annually|yearly)\b", matched_str, re.IGNORECASE):
+                    unit = "year"
+                if val is not None and val > 0:
+                    return build_dict(val, unit, work_days)
+
+        # 3. Standard / general demand patterns without explicit time unit (assumed annual in EOQ context)
+        general_patterns = [
+            r"annual\s+demand\s*(?:is|of|=|:)?\s*([\d,]+(?:\.\d+)?)",
+            r"demand\s*(?:is|of|=|:|\baverages\b)?\s*([\d,]+(?:\.\d+)?)",
+            r"demand\s+of\s*([\d,]+(?:\.\d+)?)",
+        ]
+        for pat in general_patterns:
+            m = re.search(pat, text, re.IGNORECASE)
+            if m:
+                val = clean_num(m.group(1))
+                if val is not None and val > 0:
+                    return build_dict(val, "year", work_days)
+
+        return {
+            "annual_demand": None,
+            "stated_demand": None,
+            "stated_unit": None,
+            "conversion_note": None,
+            "multiplier": 1.0,
+            "work_days": work_days,
+        }
+
+    def _extract_annual_demand(self, text: str) -> Optional[float]:
+        """Extracts annual / yearly demand rate, auto-converting non-annual units."""
+        return self._extract_demand_with_time_unit(text)["annual_demand"]
+
+    def _extract_holding_cost(
+        self,
+        text: str,
+        work_days: int = 250,
+        return_note: bool = False,
+    ) -> Any:
         """
         Extracts holding / carrying cost, distinguishing:
         - fixed holding cost ($/unit/year)
         - percentage holding rate (% of purchase price)
-        Returns: (fixed_holding_cost, percentage_holding_rate)
+        - time-unit conversions (per month, per week, per day, per quarter -> normalized to annual)
+        Returns:
+            If return_note=False: (fixed_holding_cost, percentage_holding_rate)
+            If return_note=True: (fixed_holding_cost, percentage_holding_rate, conversion_note)
         """
-        # 1. Check for percentage holding cost rate first
+        def clean_num(val_str: str) -> Optional[float]:
+            try:
+                return float(val_str.replace(",", "").strip())
+            except ValueError:
+                return None
+
+        conv_note = None
+
+        # 1. Check for percentage holding cost rate
         pct_patterns = [
             r"(?:holding|carrying)\s+(?:rate|cost|charge|expense)\s*(?:is|of|=|:)?\s*([\d,]+(?:\.\d+)?)\s*%",
             r"([\d,]+(?:\.\d+)?)\s*%\s*(?:annual\s+)?(?:holding|carrying)\s*(?:rate|cost|charge)?",
             r"([\d,]+(?:\.\d+)?)\s*%\s*of\s+(?:the\s+)?(?:unit\s+)?(?:price|cost)",
             r"holding\s+cost\s*(?:is|of|=|:)?\s*([\d,]+(?:\.\d+)?)\s*%\s*(?:of\s+(?:unit\s+)?(?:price|cost))?",
         ]
-        pct = self._extract_percentage(text, pct_patterns)
+        pct = None
+        for pat in pct_patterns:
+            m = re.search(pat, text, re.IGNORECASE)
+            if m:
+                val = clean_num(m.group(1))
+                if val is not None:
+                    raw_rate = val / 100.0 if val > 1.0 else val
+                    # Check if percentage has time unit attached (e.g. per month)
+                    post_context = text[m.start():m.end() + 25]
+                    if re.search(r"%\s*(?:per\s+month|\/month|\/mo|\bmonthly\b)", post_context, re.IGNORECASE):
+                        pct = raw_rate * 12.0
+                        conv_note = f"{raw_rate*100:.1f}%/month × 12 = {pct*100:.1f}%/year"
+                    elif re.search(r"%\s*(?:per\s+week|\/week|\/wk|\bweekly\b)", post_context, re.IGNORECASE):
+                        pct = raw_rate * 52.0
+                        conv_note = f"{raw_rate*100:.1f}%/week × 52 = {pct*100:.1f}%/year"
+                    else:
+                        pct = raw_rate
+                    break
 
-        # 2. Check for dollar holding cost
-        dollar_patterns = [
-            r"(?:fixed\s+)?(?:holding|carrying)\s+cost\s*(?:is|of|=|:)?\s*\$?\s*([\d,]+(?:\.\d+)?)(?!\s*%)",
-            r"\$?\s*([\d,]+(?:\.\d+)?)\s*(?:per\s+unit\s+per\s+year|per\s+unit\s+annually|per\s+unit\/year)",
-            r"costs?\s+\$?\s*([\d,]+(?:\.\d+)?)\s*to\s+(?:hold|carry)\s+(?:each|a|per)\s+unit",
-            r"\$?\s*([\d,]+(?:\.\d+)?)\s*(?:holding|carrying)\s+cost\s+per\s+unit",
-            r"(?:holding|carrying)\s+expense\s*(?:is|of|=|:)?\s*\$?\s*([\d,]+(?:\.\d+)?)(?!\s*%)",
+        # 2. Check for non-annual dollar holding cost (month, week, day, quarter)
+        dollar = None
+        dollar_time_patterns = [
+            (r"(?:holding|carrying)\s+cost\s*(?:is|of|=|:)?\s*\$?\s*([\d,]+(?:\.\d+)?)\s*(?:per\s+unit)?\s*(?:per\s+month|\/month|\/mo|\b(?:a|each)\s+month\b|\bmonthly\b)", "month"),
+            (r"\$?\s*([\d,]+(?:\.\d+)?)\s*(?:per\s+unit\s+per\s+month|per\s+unit\/month|\/unit\/month)", "month"),
+            (r"(?:holding|carrying)\s+cost\s*(?:is|of|=|:)?\s*\$?\s*([\d,]+(?:\.\d+)?)\s*(?:per\s+unit)?\s*(?:per\s+week|\/week|\/wk|\b(?:a|each)\s+week\b|\bweekly\b)", "week"),
+            (r"\$?\s*([\d,]+(?:\.\d+)?)\s*(?:per\s+unit\s+per\s+week|per\s+unit\/week|\/unit\/week)", "week"),
+            (r"(?:holding|carrying)\s+cost\s*(?:is|of|=|:)?\s*\$?\s*([\d,]+(?:\.\d+)?)\s*(?:per\s+unit)?\s*(?:per\s+day|\/day|\b(?:a|each)\s+day\b|\bdaily\b)", "day"),
+            (r"\$?\s*([\d,]+(?:\.\d+)?)\s*(?:per\s+unit\s+per\s+day|per\s+unit\/day|\/unit\/day)", "day"),
+            (r"(?:holding|carrying)\s+cost\s*(?:is|of|=|:)?\s*\$?\s*([\d,]+(?:\.\d+)?)\s*(?:per\s+unit)?\s*(?:per\s+quarter|\/quarter|\/qtr|\b(?:a|each)\s+quarter\b|\bquarterly\b)", "quarter"),
+            (r"\$?\s*([\d,]+(?:\.\d+)?)\s*(?:per\s+unit\s+per\s+quarter|per\s+unit\/quarter|\/unit\/quarter)", "quarter"),
         ]
-        dollar = self._extract_number(text, dollar_patterns)
+        for pat, unit in dollar_time_patterns:
+            m = re.search(pat, text, re.IGNORECASE)
+            if m:
+                val = clean_num(m.group(1))
+                if val is not None and val > 0:
+                    if unit == "month":
+                        dollar = val * 12.0
+                        conv_note = f"\\${val:,.2f}/unit/month × 12 = \\${dollar:,.2f}/unit/year"
+                    elif unit == "week":
+                        dollar = val * 52.0
+                        conv_note = f"\\${val:,.2f}/unit/week × 52 = \\${dollar:,.2f}/unit/year"
+                    elif unit == "day":
+                        dollar = val * float(work_days)
+                        conv_note = f"\\${val:,.2f}/unit/day × {work_days} = \\${dollar:,.2f}/unit/year"
+                    elif unit == "quarter":
+                        dollar = val * 4.0
+                        conv_note = f"\\${val:,.2f}/unit/quarter × 4 = \\${dollar:,.2f}/unit/year"
+                    break
 
+        # 3. Standard annual dollar holding cost
+        if dollar is None and pct is None:
+            general_dollar_patterns = [
+                r"(?:fixed\s+)?(?:holding|carrying)\s+cost\s*(?:is|of|=|:)?\s*\$?\s*([\d,]+(?:\.\d+)?)(?!\s*%)",
+                r"\$?\s*([\d,]+(?:\.\d+)?)\s*(?:per\s+unit\s+per\s+year|per\s+unit\s+annually|per\s+unit\/year)",
+                r"costs?\s+\$?\s*([\d,]+(?:\.\d+)?)\s*to\s+(?:hold|carry)\s+(?:each|a|per)\s+unit",
+                r"\$?\s*([\d,]+(?:\.\d+)?)\s*(?:holding|carrying)\s+cost\s+per\s+unit",
+                r"(?:holding|carrying)\s+expense\s*(?:is|of|=|:)?\s*\$?\s*([\d,]+(?:\.\d+)?)(?!\s*%)",
+            ]
+            dollar = self._extract_number(text, general_dollar_patterns)
+
+        if return_note:
+            return dollar, pct, conv_note
         return dollar, pct
 
     def _extract_unit_price(self, text: str) -> Optional[float]:
@@ -430,9 +629,11 @@ class InventoryDecisionAgent:
         missing: List[str] = []
 
         if model_type == InventoryModelType.EOQ:
-            d = self._extract_annual_demand(text)
+            d_info = self._extract_demand_with_time_unit(text)
+            d = d_info["annual_demand"]
             s = self._extract_ordering_cost(text)
-            f_h, pct_h = self._extract_holding_cost(text)
+            work_days = d_info["work_days"]
+            f_h, pct_h, h_note = self._extract_holding_cost(text, work_days=work_days, return_note=True)
             c = self._extract_unit_price(text)
             lt_mean, _, _ = self._extract_lead_time_parameters(text)
 
@@ -447,6 +648,8 @@ class InventoryDecisionAgent:
 
             if d is not None:
                 inputs["annual_demand"] = d
+                if d_info.get("conversion_note"):
+                    inputs["demand_conversion"] = d_info["conversion_note"]
             else:
                 missing.append("annual_demand")
 
@@ -457,6 +660,8 @@ class InventoryDecisionAgent:
 
             if h is not None:
                 inputs["holding_cost"] = h
+                if h_note:
+                    inputs["holding_conversion"] = h_note
             elif pct_h is not None and c is None:
                 missing.append("unit_cost (required to calculate holding cost from percentage rate)")
             else:
@@ -464,12 +669,14 @@ class InventoryDecisionAgent:
 
             inputs["unit_cost"] = c if c is not None else 0.0
             inputs["lead_time_days"] = lt_mean if lt_mean is not None else 0.0
-            inputs["work_days_per_year"] = 250
+            inputs["work_days_per_year"] = work_days
 
         elif model_type == InventoryModelType.QUANTITY_DISCOUNT:
-            d = self._extract_annual_demand(text)
+            d_info = self._extract_demand_with_time_unit(text)
+            d = d_info["annual_demand"]
             s = self._extract_ordering_cost(text)
-            f_h, pct_h = self._extract_holding_cost(text)
+            work_days = d_info["work_days"]
+            f_h, pct_h, h_note = self._extract_holding_cost(text, work_days=work_days, return_note=True)
             unit_price = self._extract_unit_price(text)
 
             # Extract discount tiers
@@ -533,6 +740,8 @@ class InventoryDecisionAgent:
 
             if d is not None:
                 inputs["annual_demand"] = d
+                if d_info.get("conversion_note"):
+                    inputs["demand_conversion"] = d_info["conversion_note"]
             else:
                 missing.append("annual_demand")
 
@@ -543,8 +752,12 @@ class InventoryDecisionAgent:
 
             if pct_h is not None:
                 inputs["holding_rate"] = pct_h
+                if h_note:
+                    inputs["holding_conversion"] = h_note
             elif f_h is not None:
                 inputs["fixed_holding_cost"] = f_h
+                if h_note:
+                    inputs["holding_conversion"] = h_note
             else:
                 missing.append("holding_rate or fixed_holding_cost")
 
@@ -556,12 +769,33 @@ class InventoryDecisionAgent:
             if unit_price is not None:
                 inputs["unit_purchase_price"] = unit_price
 
+            inputs["work_days_per_year"] = work_days
+
         elif model_type == InventoryModelType.SAFETY_STOCK_ROP:
+            d_info = self._extract_demand_with_time_unit(text)
             avg_d, std_d, period_d = self._extract_demand_parameters(text)
             avg_lt, std_lt, period_lt = self._extract_lead_time_parameters(text)
             csl, z_val = self._extract_service_level(text)
 
             period = period_d if period_d != "day" else period_lt
+            demand_conv = d_info.get("conversion_note")
+            work_days = d_info.get("work_days", 250)
+
+            if avg_d is None and d_info.get("annual_demand") is not None:
+                ann_d = d_info["annual_demand"]
+                if period == "day":
+                    avg_d = ann_d / float(work_days)
+                elif period == "week":
+                    avg_d = ann_d / 52.0
+                elif period == "month":
+                    avg_d = ann_d / 12.0
+                else:
+                    avg_d = ann_d
+
+            if d_info.get("annual_demand") is not None:
+                inputs["annual_demand"] = d_info["annual_demand"]
+            if demand_conv:
+                inputs["demand_conversion"] = demand_conv
 
             # Check whether problem context implies stochastic variability or deterministic constant parameters
             has_variability = (
@@ -607,6 +841,7 @@ class InventoryDecisionAgent:
             inputs["period_name"] = period
 
         elif model_type == InventoryModelType.FIXED_PERIOD_REVIEW:
+            d_info = self._extract_demand_with_time_unit(text)
             # Review period R
             r = self._extract_number(text, [
                 r"review\s+(?:period|interval)?\s*(?:is|every|of|=|:)?\s*(\d+(?:\.\d+)?)\s*(?:days?|weeks?|months?)?",
@@ -622,6 +857,24 @@ class InventoryDecisionAgent:
             csl, z_val = self._extract_service_level(text)
 
             period = period_d if period_d != "day" else period_lt
+            demand_conv = d_info.get("conversion_note")
+            work_days = d_info.get("work_days", 250)
+
+            if avg_d is None and d_info.get("annual_demand") is not None:
+                ann_d = d_info["annual_demand"]
+                if period == "day":
+                    avg_d = ann_d / float(work_days)
+                elif period == "week":
+                    avg_d = ann_d / 52.0
+                elif period == "month":
+                    avg_d = ann_d / 12.0
+                else:
+                    avg_d = ann_d
+
+            if d_info.get("annual_demand") is not None:
+                inputs["annual_demand"] = d_info["annual_demand"]
+            if demand_conv:
+                inputs["demand_conversion"] = demand_conv
 
             # Safety stock directly specified (e.g. "safety stock of 50 units")
             ss_direct = self._extract_number(text, [
@@ -810,6 +1063,8 @@ class InventoryDecisionAgent:
                 unit_cost=inputs.get("unit_cost", 0.0),
                 lead_time_days=inputs.get("lead_time_days", 0.0),
                 work_days_per_year=inputs.get("work_days_per_year", 250),
+                demand_conversion_note=inputs.get("demand_conversion"),
+                holding_conversion_note=inputs.get("holding_conversion"),
             )
             result = calculate_eoq(eoq_in)
             return tool_name, result
@@ -823,6 +1078,8 @@ class InventoryDecisionAgent:
                 holding_rate=inputs.get("holding_rate"),
                 fixed_holding_cost=inputs.get("fixed_holding_cost"),
                 work_days_per_year=inputs.get("work_days_per_year", 250),
+                demand_conversion_note=inputs.get("demand_conversion"),
+                holding_conversion_note=inputs.get("holding_conversion"),
             )
             result = calculate_quantity_discount(qd_in)
             return tool_name, result
@@ -836,6 +1093,7 @@ class InventoryDecisionAgent:
                 std_lead_time_periods=inputs.get("std_lead_time_periods", 0.0),
                 service_level=inputs.get("service_level", 0.95),
                 period_name=inputs.get("period_name", "day"),
+                demand_conversion_note=inputs.get("demand_conversion"),
             )
             result = calculate_rop(ss_in)
             return tool_name, result
@@ -854,6 +1112,7 @@ class InventoryDecisionAgent:
                 safety_stock=inputs.get("safety_stock"),
                 inventory_position=inputs.get("inventory_position"),
                 backorders=inputs.get("backorders", 0.0),
+                demand_conversion_note=inputs.get("demand_conversion"),
             )
             result = calculate_periodic_review(fp_in)
             return tool_name, result
@@ -910,8 +1169,15 @@ class InventoryDecisionAgent:
         """
         if model_type == InventoryModelType.EOQ:
             r: EOQResult = result
+            conv_prefix = ""
+            if inputs.get("demand_conversion"):
+                conv_prefix += f"\n- **Demand Annualization:** `{inputs['demand_conversion']}`"
+            if inputs.get("holding_conversion"):
+                conv_prefix += f"\n- **Holding Cost Annualization:** `{inputs['holding_conversion']}`"
+
             exec_sum = (
-                f"**Optimal Order Quantity (EOQ):** `{r.eoq:,.1f} units` per order.\n"
+                f"**Optimal Order Quantity (EOQ):** `{r.eoq:,.1f} units` per order."
+                f"{conv_prefix}\n"
                 f"- **Order Frequency:** `{r.orders_per_year:.2f} orders/year` (~every `{r.order_interval_days:.1f} working days`).\n"
                 f"- **Total Annual Inventory Cost:** `${r.total_annual_inventory_cost:,.2f}` "
                 f"(${r.annual_ordering_cost:,.2f} ordering + ${r.annual_holding_cost:,.2f} holding)."
@@ -919,13 +1185,22 @@ class InventoryDecisionAgent:
             if r.reorder_point > 0:
                 exec_sum += f"\n- **Reorder Point (ROP):** Place a replenishment order when inventory reaches `{r.reorder_point:,.1f} units`."
 
-            formula_trace = [
-                f"1. **EOQ Formula:** $Q^* = \\sqrt{{\\frac{{2DS}}{{H}}}} = \\sqrt{{\\frac{{2 \\times {inputs['annual_demand']:,.0f} \\times {inputs['order_cost']:,.2f}}}{{{inputs['holding_cost']:,.2f}}}}} = {r.eoq:,.2f}$ units.",
-                f"2. **Orders per Year:** $N = \\frac{{D}}{{Q^*}} = \\frac{{{inputs['annual_demand']:,.0f}}}{{{r.eoq:,.2f}}} = {r.orders_per_year:.2f}$.",
-                f"3. **Annual Ordering Cost:** $\\frac{{D}}{{Q^*}} S = {r.orders_per_year:.2f} \\times$ \\${inputs['order_cost']:,.2f} = \\${r.annual_ordering_cost:,.2f}.",
-                f"4. **Annual Holding Cost:** $\\frac{{Q^*}}{{2}} H = \\frac{{{r.eoq:,.2f}}}{{2}} \\times$ \\${inputs['holding_cost']:,.2f} = \\${r.annual_holding_cost:,.2f}.",
-                f"5. **Total Annual Inventory Cost:** $\\text{{AOC}} + \\text{{AHC}} =$ \\${r.total_annual_inventory_cost:,.2f}.",
-            ]
+            formula_trace = []
+            f_idx = 1
+            if inputs.get("demand_conversion"):
+                formula_trace.append(f"{f_idx}. **Demand Annualization:** {inputs['demand_conversion']}.")
+                f_idx += 1
+            if inputs.get("holding_conversion"):
+                formula_trace.append(f"{f_idx}. **Holding Cost Annualization:** {inputs['holding_conversion']}.")
+                f_idx += 1
+
+            formula_trace.extend([
+                f"{f_idx}. **EOQ Formula:** $Q^* = \\sqrt{{\\frac{{2DS}}{{H}}}} = \\sqrt{{\\frac{{2 \\times {inputs['annual_demand']:,.0f} \\times {inputs['order_cost']:,.2f}}}{{{inputs['holding_cost']:,.2f}}}}} = {r.eoq:,.2f}$ units.",
+                f"{f_idx + 1}. **Orders per Year:** $N = \\frac{{D}}{{Q^*}} = \\frac{{{inputs['annual_demand']:,.0f}}}{{{r.eoq:,.2f}}} = {r.orders_per_year:.2f}$.",
+                f"{f_idx + 2}. **Annual Ordering Cost:** $\\frac{{D}}{{Q^*}} S = {r.orders_per_year:.2f} \\times$ \\${inputs['order_cost']:,.2f} = \\${r.annual_ordering_cost:,.2f}.",
+                f"{f_idx + 3}. **Annual Holding Cost:** $\\frac{{Q^*}}{{2}} H = \\frac{{{r.eoq:,.2f}}}{{2}} \\times$ \\${inputs['holding_cost']:,.2f} = \\${r.annual_holding_cost:,.2f}.",
+                f"{f_idx + 4}. **Total Annual Inventory Cost:** $\\text{{AOC}} + \\text{{AHC}} =$ \\${r.total_annual_inventory_cost:,.2f}.",
+            ])
 
             insights = [
                 f"**Trade-off Equality:** At EOQ, annual ordering cost exactly equals annual holding cost (${r.annual_ordering_cost:,.2f} vs ${r.annual_holding_cost:,.2f}).",
@@ -946,15 +1221,26 @@ class InventoryDecisionAgent:
         elif model_type == InventoryModelType.QUANTITY_DISCOUNT:
             r: QuantityDiscountResult = result
             opt_tier = r.tier_evaluations[r.optimal_tier_index].tier
+            conv_prefix = ""
+            if inputs.get("demand_conversion"):
+                conv_prefix += f"\n- **Demand Annualization:** `{inputs['demand_conversion']}`"
+            if inputs.get("holding_conversion"):
+                conv_prefix += f"\n- **Holding Cost Annualization:** `{inputs['holding_conversion']}`"
+
             exec_sum = (
                 f"**Optimal Order Quantity:** `{r.optimal_order_qty:,.1f} units` (qualifying for Tier {r.optimal_tier_index + 1}: "
-                f"`{opt_tier.tier_name}` at `${r.optimal_unit_price:,.2f}/unit`).\n"
+                f"`{opt_tier.tier_name}` at `${r.optimal_unit_price:,.2f}/unit`)."
+                f"{conv_prefix}\n"
                 f"- **Total Annual Cost:** `${r.optimal_total_annual_cost:,.2f}` (Purchase: `${r.optimal_annual_purchase_cost:,.2f}`, "
                 f"Order: `${r.optimal_annual_ordering_cost:,.2f}`, Holding: `${r.optimal_annual_holding_cost:,.2f}`).\n"
                 f"- **Net Annual Savings vs Base Pricing:** `${r.annual_savings_vs_base:,.2f}` (`{r.percentage_savings_vs_base:.2f}%` total cost reduction)."
             )
 
             formula_trace = []
+            if inputs.get("demand_conversion"):
+                formula_trace.append(f"**Demand Annualization:** {inputs['demand_conversion']}.")
+            if inputs.get("holding_conversion"):
+                formula_trace.append(f"**Holding Cost Annualization:** {inputs['holding_conversion']}.")
             for idx, ev in enumerate(r.tier_evaluations):
                 status_str = "Feasible EOQ" if ev.is_raw_eoq_feasible else "Adjusted to Tier Price Break"
                 formula_trace.append(
@@ -980,8 +1266,10 @@ class InventoryDecisionAgent:
 
         elif model_type == InventoryModelType.SAFETY_STOCK_ROP:
             r: SafetyStockROPResult = result
+            conv_str = f"\n- **Demand Normalization:** `{inputs['demand_conversion']}`" if inputs.get("demand_conversion") else ""
             exec_sum = (
-                f"**Recommended Safety Stock (SS):** `{r.safety_stock:,.1f} units` (buffer stock).\n"
+                f"**Recommended Safety Stock (SS):** `{r.safety_stock:,.1f} units` (buffer stock)."
+                f"{conv_str}\n"
                 f"- **Reorder Point (ROP):** `{r.reorder_point:,.1f} units`.\n"
                 f"- **Cycle Service Level:** `{inputs.get('service_level', 0.95)*100:.1f}%` (Stockout risk per cycle: `{r.stockout_risk_per_cycle*100:.1f}%`).\n"
                 f"- **Expected Units Short per Cycle:** `{r.expected_short_per_cycle:.3f} units`."
@@ -1013,8 +1301,10 @@ class InventoryDecisionAgent:
 
         elif model_type == InventoryModelType.FIXED_PERIOD_REVIEW:
             r: FixedPeriodReviewResult = result
+            conv_str = f"\n- **Demand Normalization:** `{inputs['demand_conversion']}`" if inputs.get("demand_conversion") else ""
             exec_sum = (
-                f"**Target Order-Up-To Level (S):** `{r.order_up_to_level:,.1f} units`.\n"
+                f"**Target Order-Up-To Level (S):** `{r.order_up_to_level:,.1f} units`."
+                f"{conv_str}\n"
                 f"- **Recommended Order Quantity Now (q):** `{r.recommended_order_quantity:,.1f} units`.\n"
                 f"- **Review Interval:** Every `{r.review_period:.0f} {r.period_name}s` (Protection window: `{r.protection_interval:.0f} {r.period_name}s`).\n"
                 f"- **Safety Stock Required:** `{r.safety_stock:,.1f} units`."

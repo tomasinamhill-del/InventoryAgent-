@@ -176,16 +176,21 @@ def _generate_eoq_audit(
     total_cost: float,
     rop: float,
     verification: Dict[str, Any],
+    demand_conversion_note: Optional[str] = None,
+    holding_conversion_note: Optional[str] = None,
 ) -> AnalystVerificationAudit:
     num = 2.0 * demand * setup_cost
     ratio = num / hold_cost
     second_deriv = (2.0 * demand * setup_cost) / (q_star ** 3.0) if q_star > 0 else 0.0
     cost_diff = abs(annual_ordering_cost - annual_holding_cost)
 
+    demand_val_str = demand_conversion_note if demand_conversion_note else f"{demand:,.0f}"
+    hold_val_str = holding_conversion_note if holding_conversion_note else f"\\${hold_cost:,.2f}"
+
     inputs_list = [
-        {"Parameter": "Annual Demand", "Symbol": "$D$", "Value": f"{demand:,.0f}", "Units": "units/year"},
+        {"Parameter": "Annual Demand", "Symbol": "$D$", "Value": demand_val_str, "Units": "units/year"},
         {"Parameter": "Order / Setup Cost", "Symbol": "$S$", "Value": f"\\${setup_cost:,.2f}", "Units": "$/order"},
-        {"Parameter": "Holding / Carrying Cost", "Symbol": "$H$", "Value": f"\\${hold_cost:,.2f}", "Units": "$/unit/year"},
+        {"Parameter": "Holding / Carrying Cost", "Symbol": "$H$", "Value": hold_val_str, "Units": "$/unit/year"},
         {"Parameter": "Unit Purchase Price", "Symbol": "$C$", "Value": f"\\${item_cost:,.2f}" if item_cost > 0 else "Not specified (\\$0.00)", "Units": "$/unit"},
         {"Parameter": "Replenishment Lead Time", "Symbol": "$L$", "Value": f"{lead_time:.1f}" if lead_time > 0 else "0.0 (Instantaneous)", "Units": "days"},
         {"Parameter": "Annual Operating Days", "Symbol": "work_days", "Value": f"{work_days}", "Units": "days/year"},
@@ -225,17 +230,41 @@ def _generate_eoq_audit(
         f"- **Reorder Point (ROP):** $\\text{{ROP}} = \\left(\\frac{{{demand:,.0f}}}{{{work_days}}}\\right) \\times {lead_time:.1f} = {rop:,.1f}$ units"
     )
 
-    intermediate_steps = [
-        {"step": 1, "name": "Ordering Numerator (2DS)", "formula": "2 * D * S", "value": num, "formatted_value": f"{num:,.4f}", "description": "Scale product of annual demand and fixed order setup cost"},
-        {"step": 2, "name": "Holding Cost Ratio (2DS / H)", "formula": "(2 * D * S) / H", "value": ratio, "formatted_value": f"{ratio:,.4f}", "description": "Trade-off ratio between ordering scale and unit carrying cost"},
-        {"step": 3, "name": "Unrounded Optimal Lot (Q*)", "formula": "sqrt(2DS / H)", "value": q_star, "formatted_value": f"{q_star:,.4f} units", "description": "Analytical cost-minimizing order batch size"},
-        {"step": 4, "name": "Annual Orders (N)", "formula": "D / Q*", "value": orders_per_year, "formatted_value": f"{orders_per_year:,.4f} orders/yr", "description": "Replenishment frequency required across planning year"},
-        {"step": 5, "name": "Order Interval in Days (T)", "formula": "(Q* / D) * work_days", "value": order_interval_days, "formatted_value": f"{order_interval_days:,.2f} days", "description": "Working days elapsed between consecutive replenishment deliveries"},
-        {"step": 6, "name": "Annual Ordering Cost (AOC)", "formula": "N * S", "value": annual_ordering_cost, "formatted_value": f"${annual_ordering_cost:,.2f}", "description": "Total yearly expense spent placing replenishment orders"},
-        {"step": 7, "name": "Annual Holding Cost (AHC)", "formula": "(Q* / 2) * H", "value": annual_holding_cost, "formatted_value": f"${annual_holding_cost:,.2f}", "description": "Total yearly expense spent carrying cycle stock"},
-        {"step": 8, "name": "First-Order Cost Difference", "formula": "|AOC - AHC|", "value": cost_diff, "formatted_value": f"${cost_diff:,.4f}", "description": "Optimality balance: at true EOQ, ordering cost exactly balances holding cost"},
-        {"step": 9, "name": "Second Derivative (Convexity)", "formula": "2DS / (Q*)^3", "value": second_deriv, "formatted_value": f"{second_deriv:.6f}", "description": "Strict convexity test confirming that Q* is a unique global minimum"},
-    ]
+    intermediate_steps = []
+    step_num = 1
+    if demand_conversion_note:
+        intermediate_steps.append({
+            "step": f"{step_num}",
+            "name": "Demand Rate Annualization",
+            "formula": demand_conversion_note,
+            "value": demand,
+            "formatted_value": f"{demand:,.0f} units/year",
+            "description": "Normalized non-annual demand rate to standard 12-month annual horizon (D)",
+        })
+        step_num += 1
+
+    if holding_conversion_note:
+        intermediate_steps.append({
+            "step": f"{step_num}",
+            "name": "Holding Cost Annualization",
+            "formula": holding_conversion_note,
+            "value": hold_cost,
+            "formatted_value": f"${hold_cost:,.2f}/unit/year",
+            "description": "Normalized non-annual holding cost to standard 1-year annual horizon (H)",
+        })
+        step_num += 1
+
+    intermediate_steps.extend([
+        {"step": step_num, "name": "Ordering Numerator (2DS)", "formula": "2 * D * S", "value": num, "formatted_value": f"{num:,.4f}", "description": "Scale product of annual demand and fixed order setup cost"},
+        {"step": step_num + 1, "name": "Holding Cost Ratio (2DS / H)", "formula": "(2 * D * S) / H", "value": ratio, "formatted_value": f"{ratio:,.4f}", "description": "Trade-off ratio between ordering scale and unit carrying cost"},
+        {"step": step_num + 2, "name": "Unrounded Optimal Lot (Q*)", "formula": "sqrt(2DS / H)", "value": q_star, "formatted_value": f"{q_star:,.4f} units", "description": "Analytical cost-minimizing order batch size"},
+        {"step": step_num + 3, "name": "Annual Orders (N)", "formula": "D / Q*", "value": orders_per_year, "formatted_value": f"{orders_per_year:,.4f} orders/yr", "description": "Replenishment frequency required across planning year"},
+        {"step": step_num + 4, "name": "Order Interval in Days (T)", "formula": "(Q* / D) * work_days", "value": order_interval_days, "formatted_value": f"{order_interval_days:,.2f} days", "description": "Working days elapsed between consecutive replenishment deliveries"},
+        {"step": step_num + 5, "name": "Annual Ordering Cost (AOC)", "formula": "N * S", "value": annual_ordering_cost, "formatted_value": f"${annual_ordering_cost:,.2f}", "description": "Total yearly expense spent placing replenishment orders"},
+        {"step": step_num + 6, "name": "Annual Holding Cost (AHC)", "formula": "(Q* / 2) * H", "value": annual_holding_cost, "formatted_value": f"${annual_holding_cost:,.2f}", "description": "Total yearly expense spent carrying cycle stock"},
+        {"step": step_num + 7, "name": "First-Order Cost Difference", "formula": "|AOC - AHC|", "value": cost_diff, "formatted_value": f"${cost_diff:,.4f}", "description": "Optimality balance: at true EOQ, ordering cost exactly balances holding cost"},
+        {"step": step_num + 8, "name": "Second Derivative (Convexity)", "formula": "2DS / (Q*)^3", "value": second_deriv, "formatted_value": f"{second_deriv:.6f}", "description": "Strict convexity test confirming that Q* is a unique global minimum"},
+    ])
 
     final_result = {
         "optimal_order_quantity": q_star,
@@ -295,11 +324,18 @@ def _generate_quantity_discount_audit(
     savings: float,
     pct_savings: float,
     verification: Dict[str, Any],
+    demand_conversion_note: Optional[str] = None,
+    holding_conversion_note: Optional[str] = None,
 ) -> AnalystVerificationAudit:
-    hold_desc = f"{h_rate*100:.1f}% of unit price" if h_rate is not None else f"\\${f_hold:,.2f} / unit / year"
+    demand_val_str = demand_conversion_note if demand_conversion_note else f"{demand:,.0f}"
+    hold_desc = (
+        holding_conversion_note
+        if holding_conversion_note
+        else (f"{h_rate*100:.1f}% of unit price" if h_rate is not None else f"\\${f_hold:,.2f} / unit / year")
+    )
 
     inputs_list = [
-        {"Parameter": "Annual Demand", "Symbol": "$D$", "Value": f"{demand:,.0f}", "Units": "units/year"},
+        {"Parameter": "Annual Demand", "Symbol": "$D$", "Value": demand_val_str, "Units": "units/year"},
         {"Parameter": "Order / Setup Cost", "Symbol": "$S$", "Value": f"\\${setup_cost:,.2f}", "Units": "$/order"},
         {"Parameter": "Holding Cost Structure", "Symbol": "$H$", "Value": hold_desc, "Units": "% or $/unit/yr"},
         {"Parameter": "Total Discount Tiers", "Symbol": "tiers_count", "Value": f"{len(tier_evaluations)}", "Units": "tiers evaluated"},
@@ -442,9 +478,11 @@ def _generate_rop_audit(
     period_str: str,
     case_name: str,
     verification: Dict[str, Any],
+    demand_conversion_note: Optional[str] = None,
 ) -> AnalystVerificationAudit:
+    d_val_str = f"{d_val:,.1f}" + (f" ({demand_conversion_note})" if demand_conversion_note else "")
     inputs_list = [
-        {"Parameter": "Average Demand per Period", "Symbol": "$\\bar{d}$", "Value": f"{d_val:,.1f}", "Units": f"units/{period_str}"},
+        {"Parameter": "Average Demand per Period", "Symbol": "$\\bar{d}$", "Value": d_val_str, "Units": f"units/{period_str}"},
         {"Parameter": "Demand Std Dev per Period", "Symbol": "$\\sigma_d$", "Value": f"{sig_d:,.2f}", "Units": f"units/{period_str}"},
         {"Parameter": "Average Lead Time", "Symbol": "$\\bar{L}$", "Value": f"{L_val:.1f}", "Units": f"{period_str}s"},
         {"Parameter": "Lead Time Std Dev", "Symbol": "$\\sigma_L$", "Value": f"{sig_L_val:.2f}" if sig_L_val > 0 else "0.0 (Deterministic)", "Units": f"{period_str}s"},
@@ -567,11 +605,13 @@ def _generate_periodic_review_audit(
     ss_ratio: float,
     period_str: str,
     verification: Dict[str, Any],
+    demand_conversion_note: Optional[str] = None,
 ) -> AnalystVerificationAudit:
+    d_val_str = f"{d_val:,.1f}" + (f" ({demand_conversion_note})" if demand_conversion_note else "")
     inputs_list = [
         {"Parameter": "Review Period", "Symbol": "$R$", "Value": f"{R_val:.0f}", "Units": f"{period_str}s"},
         {"Parameter": "Supplier Lead Time", "Symbol": "$L$", "Value": f"{L_val:.0f}", "Units": f"{period_str}s"},
-        {"Parameter": "Average Demand per Period", "Symbol": "$\\bar{d}$", "Value": f"{d_val:,.1f}", "Units": f"units/{period_str}"},
+        {"Parameter": "Average Demand per Period", "Symbol": "$\\bar{d}$", "Value": d_val_str, "Units": f"units/{period_str}"},
         {"Parameter": "Demand Std Dev per Period", "Symbol": "$\\sigma_d$", "Value": f"{sig_d:,.2f}", "Units": f"units/{period_str}"},
         {"Parameter": "Target Service Level", "Symbol": "$\\text{CSL}$", "Value": f"{calc_csl*100:.1f}%", "Units": "% in-stock probability"},
         {"Parameter": "Current On-Hand Stock", "Symbol": "$\\text{OH}$", "Value": f"{on_hand:,.1f}", "Units": "units"},
@@ -832,6 +872,8 @@ class EOQInputs:
     unit_cost: float = 0.0
     lead_time_days: float = 0.0
     work_days_per_year: int = 250
+    demand_conversion_note: Optional[str] = None
+    holding_conversion_note: Optional[str] = None
 
 
 @dataclass
@@ -873,6 +915,8 @@ def calculate_eoq(
     S: Optional[float] = None,
     H: Optional[float] = None,
     C: Optional[float] = None,
+    demand_conversion_note: Optional[str] = None,
+    holding_conversion_note: Optional[str] = None,
 ) -> EOQResult:
     """
     Calculates the Economic Order Quantity (EOQ):
@@ -890,6 +934,8 @@ def calculate_eoq(
         item_cost = in_obj.unit_cost
         lead_time = in_obj.lead_time_days
         work_days = in_obj.work_days_per_year
+        demand_conv = in_obj.demand_conversion_note or demand_conversion_note
+        hold_conv = in_obj.holding_conversion_note or holding_conversion_note
     else:
         demand = annual_demand if annual_demand is not None else D
         setup_cost = order_cost if order_cost is not None else S
@@ -897,6 +943,8 @@ def calculate_eoq(
         item_cost = unit_cost if unit_cost is not None else C
         lead_time = lead_time_days
         work_days = work_days_per_year
+        demand_conv = demand_conversion_note
+        hold_conv = holding_conversion_note
 
     # Strict input validation - never invent missing numerical inputs
     if demand is None:
@@ -1030,6 +1078,8 @@ def calculate_eoq(
         total_cost=total_cost,
         rop=rop,
         verification=verification,
+        demand_conversion_note=demand_conv,
+        holding_conversion_note=hold_conv,
     )
 
     return EOQResult(
@@ -1094,6 +1144,8 @@ class QuantityDiscountInputs:
     holding_rate: Optional[float] = None
     fixed_holding_cost: Optional[float] = None
     work_days_per_year: int = 250
+    demand_conversion_note: Optional[str] = None
+    holding_conversion_note: Optional[str] = None
 
 
 @dataclass
@@ -1146,6 +1198,8 @@ def calculate_quantity_discount(
     # Support D, S aliases
     D: Optional[float] = None,
     S: Optional[float] = None,
+    demand_conversion_note: Optional[str] = None,
+    holding_conversion_note: Optional[str] = None,
 ) -> QuantityDiscountResult:
     """
     Evaluates an all-units quantity discount schedule and identifies the cost-minimizing order quantity.
@@ -1162,6 +1216,8 @@ def calculate_quantity_discount(
         h_rate = in_obj.holding_rate
         f_hold = in_obj.fixed_holding_cost
         work_days = in_obj.work_days_per_year
+        demand_conv = in_obj.demand_conversion_note or demand_conversion_note
+        hold_conv = in_obj.holding_conversion_note or holding_conversion_note
     else:
         demand = annual_demand if annual_demand is not None else D
         setup_cost = order_cost if order_cost is not None else S
@@ -1169,6 +1225,8 @@ def calculate_quantity_discount(
         h_rate = holding_rate
         f_hold = fixed_holding_cost
         work_days = work_days_per_year
+        demand_conv = demand_conversion_note
+        hold_conv = holding_conversion_note
 
     # Input validation
     if demand is None:
@@ -1347,6 +1405,8 @@ def calculate_quantity_discount(
         savings=savings,
         pct_savings=pct_savings,
         verification=verification,
+        demand_conversion_note=demand_conv,
+        holding_conversion_note=hold_conv,
     )
 
     return QuantityDiscountResult(
@@ -1382,6 +1442,7 @@ class SafetyStockROPInputs:
     std_lead_time_periods: float = 0.0
     service_level: float = 0.95
     period_name: str = "day"
+    demand_conversion_note: Optional[str] = None
 
 
 @dataclass
@@ -1436,6 +1497,7 @@ def calculate_rop(
     std_demand_per_period: Optional[float] = None,
     lead_time_periods: Optional[float] = None,
     std_lead_time_periods: Optional[float] = None,
+    demand_conversion_note: Optional[str] = None,
 ) -> ROPResult:
     """
     Calculates Safety Stock (SS) and Reorder Point (ROP).
@@ -1460,6 +1522,7 @@ def calculate_rop(
         sl_val = in_obj.service_level
         z_val = None
         period_str = in_obj.period_name
+        demand_conv = in_obj.demand_conversion_note or demand_conversion_note
     else:
         d_val = demand_mean if demand_mean is not None else (avg_demand_per_period if avg_demand_per_period is not None else d)
         L_val = lead_time_mean if lead_time_mean is not None else (lead_time_periods if lead_time_periods is not None else L)
@@ -1468,6 +1531,7 @@ def calculate_rop(
         sl_val = service_level if service_level is not None else csl
         z_val = z_score if z_score is not None else z
         period_str = period_name if period_name is not None else "day"
+        demand_conv = demand_conversion_note
 
     # Input validation - never invent missing numerical inputs
     if d_val is None:
@@ -1631,6 +1695,7 @@ def calculate_rop(
         period_str=period_str,
         case_name=case_name,
         verification=verification,
+        demand_conversion_note=demand_conv,
     )
 
     return ROPResult(
@@ -1675,6 +1740,7 @@ class FixedPeriodReviewInputs:
     safety_stock: Optional[float] = None
     inventory_position: Optional[float] = None
     backorders: float = 0.0
+    demand_conversion_note: Optional[str] = None
 
 
 @dataclass
@@ -1741,6 +1807,7 @@ def calculate_periodic_review(
     std_demand_per_period: Optional[float] = None,
     current_on_hand: Optional[float] = None,
     current_on_order: Optional[float] = None,
+    demand_conversion_note: Optional[str] = None,
 ) -> PeriodicReviewResult:
     """
     Calculates Fixed-Period Review (Periodic Review / Order-Up-To) policy:
@@ -1765,6 +1832,7 @@ def calculate_periodic_review(
         bo_val = getattr(in_obj, "backorders", 0.0)
         ss_val = getattr(in_obj, "safety_stock", None)
         period_str = in_obj.period_name
+        demand_conv = getattr(in_obj, "demand_conversion_note", None) or demand_conversion_note
     else:
         R_val = review_period if review_period is not None else R
         L_val = lead_time if lead_time is not None else L
@@ -1778,6 +1846,7 @@ def calculate_periodic_review(
         bo_val = backorders if backorders is not None else B
         ss_val = safety_stock if safety_stock is not None else SS
         period_str = period_name if period_name is not None else "day"
+        demand_conv = demand_conversion_note
 
     # Input validation
     if R_val is None:
@@ -1924,6 +1993,7 @@ def calculate_periodic_review(
         ss_ratio=ss_ratio,
         period_str=period_str,
         verification=verification,
+        demand_conversion_note=demand_conv,
     )
 
     return PeriodicReviewResult(

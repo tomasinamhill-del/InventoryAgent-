@@ -19,7 +19,12 @@ flowchart LR
 The agent executes a deterministic 7-stage workflow:
 1. **Customer Question**: Free-form natural-language input from inventory managers.
 2. **Identify Model**: Multi-signal classification across 5 supported inventory models.
-3. **Extract Inputs**: Robust parsing of units, intervals, currencies, percentages, and quantity discount schedules.
+3. **Extract Inputs**: Robust parsing of units, intervals, currencies, percentages, and quantity discount schedules, with automatic time-unit normalization:
+   - **Monthly demand**: Multiplied by 12 ($1,000\text{ units/month} \times 12 = 12,000\text{ units/year}$).
+   - **Weekly demand**: Multiplied by 52 ($250\text{ units/week} \times 52 = 13,000\text{ units/year}$).
+   - **Daily demand**: Multiplied by operating days ($40\text{ units/day} \times 250\text{ work days/year} = 10,000\text{ units/year}$, or $\times 365$ for calendar days).
+   - **Quarterly demand**: Multiplied by 4 ($3,000\text{ units/quarter} \times 4 = 12,000\text{ units/year}$).
+   - **Non-annual holding costs**: Automatically normalized to annual basis (e.g. $\$0.10/\text{unit/month} \times 12 = \$1.20/\text{unit/year}$), displaying the explicit calculation in Section 1 of the verification audit.
 4. **Select Python Tool**: Maps the problem to the exact mathematical routine in `inventory_tools.py`.
 5. **Calculate**: Pure Python numerical evaluation with high precision.
 6. **Verify**: Automated invariant verification (first-order conditions, non-negativity, convex second derivatives, and inventory conservation).

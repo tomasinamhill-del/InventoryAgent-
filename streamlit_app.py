@@ -1627,10 +1627,36 @@ def render_app():
                         st.write("Parameters automatically parsed from your question by the entity extraction engine:")
 
                         param_items = []
+                        friendly_labels = {
+                            "annual_demand": "Annual Demand (D)",
+                            "demand_conversion": "Demand Unit Conversion",
+                            "order_cost": "Order / Setup Cost (S)",
+                            "holding_cost": "Holding Cost (H)",
+                            "holding_conversion": "Holding Cost Normalization",
+                            "unit_cost": "Unit Cost (C)",
+                            "lead_time_days": "Lead Time (days)",
+                            "work_days_per_year": "Annual Operating Days",
+                            "holding_rate": "Holding Cost Rate (i)",
+                            "fixed_holding_cost": "Fixed Holding Cost (H)",
+                            "avg_demand_per_period": "Average Demand per Period (d)",
+                            "std_demand_per_period": "Demand Std Dev (sigma_d)",
+                            "lead_time_periods": "Lead Time (periods)",
+                            "std_lead_time_periods": "Lead Time Std Dev (sigma_L)",
+                            "service_level": "Service Level (CSL)",
+                            "period_name": "Period Name",
+                            "review_period": "Review Period (R)",
+                            "lead_time": "Lead Time (L)",
+                            "current_on_hand": "Current On-Hand (OH)",
+                            "current_on_order": "Current On-Order (OO)",
+                            "backorders": "Current Backorders (BO)",
+                            "inventory_position": "Inventory Position (IP)",
+                            "safety_stock": "Safety Stock (SS)",
+                        }
                         for k, v in result.extracted_inputs.items():
                             if k == "tiers":
                                 continue
-                            param_items.append({"Parameter": k, "Extracted Value": str(v)})
+                            label = friendly_labels.get(k, k)
+                            param_items.append({"Parameter": label, "Extracted Value": str(v)})
 
                         col_p1, col_p2 = st.columns([1.2, 1])
                         with col_p1:
