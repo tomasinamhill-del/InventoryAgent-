@@ -86,6 +86,9 @@ class SimpleSeries:
             name=self.name,
         )
 
+    def apply(self, func: Any) -> SimpleSeries:
+        return SimpleSeries([func(x) for x in self.data], name=self.name)
+
     def tolist(self) -> List[Any]:
         return list(self.data)
 
@@ -525,6 +528,31 @@ def normalize_column_name(col: str) -> str:
     return cleaned
 
 
+def clean_numeric_series(series: Any) -> Any:
+    """
+    Sanitize string values in a numeric column by stripping currency symbols ($),
+    commas (,), and whitespace before calling pd.to_numeric(..., errors="coerce").
+
+    Ensures formatted prices and counts like '$2.50', '$1,250.00', and '2,500' parse
+    accurately to numeric floats instead of coercing to 0.0 or NaN in pandas.
+    """
+    def _strip_val(x: Any) -> Any:
+        if x is None or (isinstance(x, float) and math.isnan(x)):
+            return x
+        if isinstance(x, str):
+            # Remove currency symbols ($), thousand-separator commas (,), and whitespace
+            return re.sub(r"[\$,\s]", "", x.strip())
+        return x
+
+    if hasattr(series, "apply"):
+        return series.apply(_strip_val)
+    elif hasattr(series, "data"):
+        return SimpleSeries([_strip_val(x) for x in series.data], name=getattr(series, "name", ""))
+    elif isinstance(series, (list, tuple)):
+        return [_strip_val(x) for x in series]
+    return series
+
+
 def load_and_process_inventory_csv(file_or_content: Any) -> Tuple[Any, Any, Dict[str, Any]]:
     """
     Load an inventory CSV into a DataFrame, validate expected columns case-insensitively,
@@ -582,12 +610,16 @@ def load_and_process_inventory_csv(file_or_content: Any) -> Tuple[Any, Any, Dict
         for old_col, new_col in col_mapping.items():
             processed_df[new_col] = processed_df[old_col]
 
-    # Clean and convert numeric columns
-    processed_df["units"] = pd.to_numeric(processed_df["units"], errors="coerce")
+    # Clean and convert numeric columns: strip currency ($), commas (,), and whitespace
+    # before calling pd.to_numeric(..., errors="coerce") so formatted prices and counts
+    # like "$2.50", "$1,250.00", or "1,000" parse accurately instead of coercing to 0.0.
+    cleaned_units = clean_numeric_series(processed_df["units"])
+    processed_df["units"] = pd.to_numeric(cleaned_units, errors="coerce")
     if hasattr(processed_df["units"], "fillna"):
         processed_df["units"] = processed_df["units"].fillna(0)
 
-    processed_df["unit_cost"] = pd.to_numeric(processed_df["unit_cost"], errors="coerce")
+    cleaned_cost = clean_numeric_series(processed_df["unit_cost"])
+    processed_df["unit_cost"] = pd.to_numeric(cleaned_cost, errors="coerce")
     if hasattr(processed_df["unit_cost"], "fillna"):
         processed_df["unit_cost"] = processed_df["unit_cost"].fillna(0.0)
 
