@@ -1186,8 +1186,28 @@ class QuantityDiscountResult:
     def annual_cost_savings_vs_base(self) -> float:
         return self.annual_savings_vs_base
 
+    @property
+    def percentage_savings(self) -> float:
+        return self.percentage_savings_vs_base
+
+    @property
+    def savings_pct(self) -> float:
+        return self.percentage_savings_vs_base
+
+    @property
+    def dollar_savings(self) -> float:
+        return self.annual_savings_vs_base
+
+    @property
+    def annual_savings(self) -> float:
+        return self.annual_savings_vs_base
+
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
+
+
+# Type alias for external / backward-compatible callers
+QuantityDiscountOutput = QuantityDiscountResult
 
 
 def calculate_quantity_discount(

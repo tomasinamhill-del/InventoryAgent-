@@ -1535,14 +1535,45 @@ def render_app():
 
                     elif model_type == InventoryModelType.QUANTITY_DISCOUNT:
                         r: QuantityDiscountResult = calc_res
+                        opt_qty = getattr(r, "optimal_order_quantity", getattr(r, "optimal_order_qty", getattr(r, "final_answer", 0.0)))
+                        opt_price = getattr(r, "optimal_unit_price", 0.0)
+                        opt_cost = getattr(r, "optimal_total_annual_cost", getattr(r, "optimal_total_cost", 0.0))
+                        tier_idx = getattr(r, "optimal_tier_index", 0)
+
+                        dollar_sav = getattr(
+                            r,
+                            "annual_savings_vs_base",
+                            getattr(
+                                r,
+                                "dollar_savings",
+                                getattr(r, "annual_savings", None),
+                            ),
+                        )
+                        pct_sav = getattr(
+                            r,
+                            "percentage_savings_vs_base",
+                            getattr(
+                                r,
+                                "percentage_savings",
+                                getattr(r, "savings_pct", None),
+                            ),
+                        )
+
+                        # Safely calculate from base_tier_cost / base_total_cost and optimal_total_annual_cost if needed
+                        base_cost = getattr(r, "base_tier_cost", getattr(r, "base_total_cost", None))
+                        if dollar_sav is None:
+                            dollar_sav = (base_cost - opt_cost) if (base_cost is not None and opt_cost is not None) else 0.0
+                        if pct_sav is None:
+                            pct_sav = (((base_cost - opt_cost) / base_cost) * 100.0) if (base_cost and base_cost > 0) else 0.0
+
                         with kpi_cols[0]:
-                            st.metric("Optimal Order Quantity", f"{r.optimal_order_qty:,.1f} units", delta=f"Tier {r.optimal_tier_index + 1}")
+                            st.metric("Optimal Order Quantity", f"{opt_qty:,.1f} units", delta=f"Tier {tier_idx + 1}")
                         with kpi_cols[1]:
-                            st.metric("Optimal Unit Price", f"${r.optimal_unit_price:,.2f} / unit", delta=f"-{r.percentage_savings:.1f}% vs base")
+                            st.metric("Optimal Unit Price", f"${opt_price:,.2f} / unit", delta=f"-{pct_sav:.1f}% vs base" if pct_sav > 0 else None)
                         with kpi_cols[2]:
-                            st.metric("Total Annual Cost", f"${r.optimal_total_annual_cost:,.2f}")
+                            st.metric("Total Annual Cost", f"${opt_cost:,.2f}")
                         with kpi_cols[3]:
-                            st.metric("Annual Savings", f"${r.dollar_savings:,.2f}", delta=f"{r.percentage_savings:.2f}% savings")
+                            st.metric("Annual Savings", f"${dollar_sav:,.2f}", delta=f"{pct_sav:.2f}% savings" if pct_sav > 0 else None)
 
                     elif model_type == InventoryModelType.SAFETY_STOCK_ROP:
                         r: SafetyStockROPResult = calc_res
