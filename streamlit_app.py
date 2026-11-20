@@ -1630,6 +1630,7 @@ def render_app():
                         friendly_labels = {
                             "annual_demand": "Annual Demand (D)",
                             "demand_conversion": "Demand Unit Conversion",
+                            "lead_time_conversion": "Lead Time Unit Alignment",
                             "order_cost": "Order / Setup Cost (S)",
                             "holding_cost": "Holding Cost (H)",
                             "holding_conversion": "Holding Cost Normalization",

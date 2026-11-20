@@ -479,12 +479,14 @@ def _generate_rop_audit(
     case_name: str,
     verification: Dict[str, Any],
     demand_conversion_note: Optional[str] = None,
+    lead_time_conversion_note: Optional[str] = None,
 ) -> AnalystVerificationAudit:
     d_val_str = f"{d_val:,.1f}" + (f" ({demand_conversion_note})" if demand_conversion_note else "")
+    L_val_str = f"{L_val:.1f}" + (f" ({lead_time_conversion_note})" if lead_time_conversion_note else "")
     inputs_list = [
         {"Parameter": "Average Demand per Period", "Symbol": "$\\bar{d}$", "Value": d_val_str, "Units": f"units/{period_str}"},
         {"Parameter": "Demand Std Dev per Period", "Symbol": "$\\sigma_d$", "Value": f"{sig_d:,.2f}", "Units": f"units/{period_str}"},
-        {"Parameter": "Average Lead Time", "Symbol": "$\\bar{L}$", "Value": f"{L_val:.1f}", "Units": f"{period_str}s"},
+        {"Parameter": "Average Lead Time", "Symbol": "$\\bar{L}$", "Value": L_val_str, "Units": f"{period_str}s"},
         {"Parameter": "Lead Time Std Dev", "Symbol": "$\\sigma_L$", "Value": f"{sig_L_val:.2f}" if sig_L_val > 0 else "0.0 (Deterministic)", "Units": f"{period_str}s"},
         {"Parameter": "Cycle Service Level", "Symbol": "$\\text{CSL}$", "Value": f"{calc_csl*100:.1f}%", "Units": "% in-stock probability"},
         {"Parameter": "Operational Case", "Symbol": "case_type", "Value": case_name, "Units": "model taxonomy"},
@@ -1443,6 +1445,7 @@ class SafetyStockROPInputs:
     service_level: float = 0.95
     period_name: str = "day"
     demand_conversion_note: Optional[str] = None
+    lead_time_conversion_note: Optional[str] = None
 
 
 @dataclass
@@ -1498,6 +1501,7 @@ def calculate_rop(
     lead_time_periods: Optional[float] = None,
     std_lead_time_periods: Optional[float] = None,
     demand_conversion_note: Optional[str] = None,
+    lead_time_conversion_note: Optional[str] = None,
 ) -> ROPResult:
     """
     Calculates Safety Stock (SS) and Reorder Point (ROP).
@@ -1523,6 +1527,7 @@ def calculate_rop(
         z_val = None
         period_str = in_obj.period_name
         demand_conv = in_obj.demand_conversion_note or demand_conversion_note
+        lead_time_conv = in_obj.lead_time_conversion_note or lead_time_conversion_note
     else:
         d_val = demand_mean if demand_mean is not None else (avg_demand_per_period if avg_demand_per_period is not None else d)
         L_val = lead_time_mean if lead_time_mean is not None else (lead_time_periods if lead_time_periods is not None else L)
@@ -1532,6 +1537,7 @@ def calculate_rop(
         z_val = z_score if z_score is not None else z
         period_str = period_name if period_name is not None else "day"
         demand_conv = demand_conversion_note
+        lead_time_conv = lead_time_conversion_note
 
     # Input validation - never invent missing numerical inputs
     if d_val is None:
@@ -1696,6 +1702,7 @@ def calculate_rop(
         case_name=case_name,
         verification=verification,
         demand_conversion_note=demand_conv,
+        lead_time_conversion_note=lead_time_conv,
     )
 
     return ROPResult(
