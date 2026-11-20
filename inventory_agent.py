@@ -540,30 +540,94 @@ class InventoryDecisionAgent:
         Distinguishes:
         - average lead time
         - lead-time standard deviation
+        - lead-time period unit ('day', 'week', 'month')
         Returns: (avg_lead_time, std_lead_time, period_name)
         """
-        period_name = "day"
-        if re.search(r"\bweeks?\b", text, re.IGNORECASE):
-            period_name = "week"
-        elif re.search(r"\bmonths?\b", text, re.IGNORECASE):
-            period_name = "month"
+        # 1. Determine lead-time period unit specifically from lead time phrases
+        period_name = None
+        m_unit = re.search(
+            r"(?:lead[- ]time|replenishment|delivery|transit)[^;\n]*?(?:averages|is|of|=|:)?\s*[\d,]+(?:\.\d+)?\s*(days?|weeks?|months?)",
+            text,
+            re.IGNORECASE,
+        )
+        if m_unit:
+            u_str = m_unit.group(1).lower()
+            if "week" in u_str:
+                period_name = "week"
+            elif "month" in u_str:
+                period_name = "month"
+            elif "day" in u_str:
+                period_name = "day"
 
-        # Lead time std dev
+        if not period_name:
+            m_hyphen = re.search(r"[\d,]+(?:\.\d+)?\s*[- ](day|week|month)\s+(?:lead[- ]time|delivery|replenishment)", text, re.IGNORECASE)
+            if m_hyphen:
+                u_str = m_hyphen.group(1).lower()
+                if "week" in u_str:
+                    period_name = "week"
+                elif "month" in u_str:
+                    period_name = "month"
+                elif "day" in u_str:
+                    period_name = "day"
+
+        if not period_name:
+            m_std_unit = re.search(
+                r"(?:standard\s+deviation|std\s+dev|sigma)[^;\n]*?(?:lead[- ]time|delivery|replenishment)[^;\n]*?\s*[\d,]+(?:\.\d+)?\s*(days?|weeks?|months?)",
+                text,
+                re.IGNORECASE,
+            )
+            if m_std_unit:
+                u_str = m_std_unit.group(1).lower()
+                if "week" in u_str:
+                    period_name = "week"
+                elif "month" in u_str:
+                    period_name = "month"
+                elif "day" in u_str:
+                    period_name = "day"
+
+        if not period_name:
+            if re.search(r"\bweeks?\b", text, re.IGNORECASE):
+                period_name = "week"
+            elif re.search(r"\bmonths?\b", text, re.IGNORECASE):
+                period_name = "month"
+            else:
+                period_name = "day"
+
+        # 2. Check combined pattern: e.g. "lead time is 3 weeks with a standard deviation of 0.5 weeks"
+        combined_pattern = (
+            r"(?:lead[- ]time|delivery|replenishment)\s+(?:averages|is|of|=|:)?\s*([\d,]+(?:\.\d+)?)\s*"
+            r"(?:days?|weeks?|months?)?\s*(?:,|with\s+(?:a\s+)?)?(?:and\s+)?(?:a\s+)?"
+            r"(?:standard\s+deviation|std\s+dev|sigma)\s*(?:of|=|:)?\s*([\d,]+(?:\.\d+)?)"
+        )
+        m_comb = re.search(combined_pattern, text, re.IGNORECASE)
+        if m_comb:
+            avg_lt = self._clean_number(m_comb.group(1))
+            std_lt = self._clean_number(m_comb.group(2))
+            return avg_lt, std_lt, period_name
+
+        # 3. Otherwise extract std_lt using explicit patterns
         std_patterns = [
-            r"(?:lead[- ]time\s+standard\s+deviation|standard\s+deviation\s+of\s+lead[- ]time|lead[- ]time\s+std\s+dev|std\s+dev\s+of\s+lead[- ]time|lead[- ]time\s+sigma)\s*(?:is|of|=|:)?\s*([\d,]+(?:\.\d+)?)",
-            r"lead[- ]time\s+(?:varies\s+with\s+(?:a\s+)?|has\s+(?:a\s+)?)(?:standard\s+deviation|std\s+dev)\s*(?:of|=|:)?\s*([\d,]+(?:\.\d+)?)",
-            r"(?:with\s+a\s+)?(?:std\s+dev|standard\s+deviation)\s+in\s+lead[- ]time\s+(?:of\s+)?([\d,]+(?:\.\d+)?)",
+            r"(?:standard\s+deviation|std\s+dev|sigma)\s+of\s+(?:the\s+)?(?:supplier|replenishment|delivery)?\s*lead[- ]time\s*(?:is|of|=|:)?\s*([\d,]+(?:\.\d+)?)",
+            r"(?:supplier|replenishment|delivery)?\s*lead[- ]time\s+(?:standard\s+deviation|std\s+dev|sigma)\s*(?:is|of|=|:)?\s*([\d,]+(?:\.\d+)?)",
+            r"(?:supplier|replenishment|delivery)?\s*lead[- ]time\s+(?:varies\s+with\s+(?:a\s+)?|has\s+(?:a\s+)?)(?:standard\s+deviation|std\s+dev)\s*(?:of|=|:)?\s*([\d,]+(?:\.\d+)?)",
+            r"(?:with\s+a\s+)?(?:std\s+dev|standard\s+deviation)\s+in\s+(?:the\s+)?lead[- ]time\s+(?:of|=|:)?\s*([\d,]+(?:\.\d+)?)",
+            r"(?:supplier|replenishment|delivery)?\s*lead[- ]time\s+std\s+dev\s*(?:of|=|:)?\s*([\d,]+(?:\.\d+)?)",
+            r"standard\s+deviation\s+of\s+lead[- ]time\s*(?:is|of|=|:)?\s*([\d,]+(?:\.\d+)?)",
         ]
         std_lt = self._extract_number(text, std_patterns)
 
-        # Average lead time
+        # 4. Extract avg_lt after masking out lead-time standard deviation phrases
+        masked_text = text
+        for pat in std_patterns:
+            masked_text = re.sub(pat, " ", masked_text, flags=re.IGNORECASE)
+
         avg_patterns = [
-            r"(?:average|mean|expected)\s+lead[- ]time\s*(?:is|of|=|:)?\s*([\d,]+(?:\.\d+)?)",
-            r"(?:supplier|replenishment|delivery)?\s*lead[- ]time\s*(?:averages|is|of|=|:)?\s*([\d,]+(?:\.\d+)?)\s*(?:days?|weeks?|months?)?",
-            r"([\d,]+(?:\.\d+)?)\s*[- ](?:day|week|month)\s+lead[- ]time",
+            r"(?:average|mean|expected)\s+(?:supplier|replenishment|delivery)?\s*lead[- ]time\s*(?:averages|is|of|=|:)?\s*([\d,]+(?:\.\d+)?)",
+            r"(?:supplier|replenishment|delivery)?\s*lead[- ]time\s*(?:averages|is|of|=|:)?\s*([\d,]+(?:\.\d+)?)",
+            r"([\d,]+(?:\.\d+)?)\s*[- ](?:day|week|month)\s+(?:lead[- ]time|delivery|replenishment)",
             r"lead[- ]time\s+(?:of|=|:)\s*([\d,]+(?:\.\d+)?)",
         ]
-        avg_lt = self._extract_number(text, avg_patterns)
+        avg_lt = self._extract_number(masked_text, avg_patterns)
 
         return avg_lt, std_lt, period_name
 
@@ -572,24 +636,82 @@ class InventoryDecisionAgent:
         Distinguishes:
         - average demand
         - demand standard deviation
+        - demand period unit ('day', 'week', 'month', 'year')
         Returns: (avg_demand, std_demand, period_name)
         """
-        period_name = "day"
-        if re.search(r"\bweeks?\b", text, re.IGNORECASE):
-            period_name = "week"
-        elif re.search(r"\bmonths?\b", text, re.IGNORECASE):
-            period_name = "month"
+        # 1. Determine demand period unit specifically from demand phrases
+        period_name = None
+        m_d_unit = re.search(
+            r"(?:demand|usage|sales|requirement|consumption)[^;\n]*?(?:per|\/)\s*(day|week|month|quarter|year)",
+            text,
+            re.IGNORECASE,
+        )
+        if m_d_unit:
+            u_str = m_d_unit.group(1).lower()
+            if "week" in u_str:
+                period_name = "week"
+            elif "month" in u_str:
+                period_name = "month"
+            elif "day" in u_str:
+                period_name = "day"
 
-        # Demand std dev
+        if not period_name:
+            m_units_per = re.search(r"units?\s*(?:per|\/)\s*(day|week|month)", text, re.IGNORECASE)
+            if m_units_per:
+                u_str = m_units_per.group(1).lower()
+                if "week" in u_str:
+                    period_name = "week"
+                elif "month" in u_str:
+                    period_name = "month"
+                elif "day" in u_str:
+                    period_name = "day"
+
+        if not period_name:
+            m_pre = re.search(r"\b(daily|weekly|monthly)\s+(?:demand|usage|sales)", text, re.IGNORECASE)
+            if m_pre:
+                u_str = m_pre.group(1).lower()
+                if "week" in u_str:
+                    period_name = "week"
+                elif "month" in u_str:
+                    period_name = "month"
+                elif "day" in u_str:
+                    period_name = "day"
+
+        if not period_name:
+            if re.search(r"\b(daily|per\s+day|\/day)\b", text, re.IGNORECASE):
+                period_name = "day"
+            elif re.search(r"\b(weekly|per\s+week|\/week)\b", text, re.IGNORECASE):
+                period_name = "week"
+            elif re.search(r"\b(monthly|per\s+month|\/month)\b", text, re.IGNORECASE):
+                period_name = "month"
+            else:
+                period_name = "day"
+
+        # 2. Mask out lead time sentences/clauses so demand std dev extraction
+        # does not accidentally pick up lead time standard deviation
+        masked_for_demand = re.sub(
+            r"(?:standard\s+deviation|std\s+dev|sigma)\s+(?:of\s+)?(?:the\s+)?(?:lead[- ]time|delivery|replenishment)[^;\n]*?(?:\.\s+|\.$|;|\n|$)",
+            " ",
+            text,
+            flags=re.IGNORECASE,
+        )
+        masked_for_demand = re.sub(
+            r"(?:average\s+|mean\s+|expected\s+)?(?:lead[- ]time|delivery|replenishment)[^;\n]*?(?:\.\s+|\.$|;|\n|$)",
+            " ",
+            masked_for_demand,
+            flags=re.IGNORECASE,
+        )
+
+        # 3. Demand std dev
         std_patterns = [
             r"(?:demand\s+standard\s+deviation|standard\s+deviation\s+of\s+demand|demand\s+std\s+dev|std\s+dev\s+of\s+demand|demand\s+sigma)\s*(?:is|of|=|:)?\s*([\d,]+(?:\.\d+)?)",
             r"(?:with\s+(?:a\s+)?)?(?:standard\s+deviation|std\s+dev|sigma)\s+(?:of\s+demand\s+)?(?:is|of|=|:)?\s*([\d,]+(?:\.\d+)?)",
             r"demand\s+(?:varies\s+with\s+(?:a\s+)?|has\s+(?:a\s+)?)(?:standard\s+deviation|std\s+dev)\s*(?:of|=|:)?\s*([\d,]+(?:\.\d+)?)",
             r"std\s+dev\s*[:=]?\s*([\d,]+(?:\.\d+)?)",
         ]
-        std_d = self._extract_number(text, std_patterns)
+        std_d = self._extract_number(masked_for_demand, std_patterns)
 
-        # Average demand
+        # 4. Average demand
         avg_patterns = [
             r"(?:average|mean|expected)\s+(?:daily|weekly|monthly)?\s*demand\s*(?:averages|is|of|=|:)?\s*([\d,]+(?:\.\d+)?)",
             r"(?:daily|weekly|monthly)\s+demand\s*(?:averages|is|of|=|:)?\s*([\d,]+(?:\.\d+)?)",
@@ -777,9 +899,63 @@ class InventoryDecisionAgent:
             avg_lt, std_lt, period_lt = self._extract_lead_time_parameters(text)
             csl, z_val = self._extract_service_level(text)
 
-            period = period_d if period_d != "day" else period_lt
             demand_conv = d_info.get("conversion_note")
             work_days = d_info.get("work_days", 250)
+
+            # Unit Alignment between Demand Period and Lead Time Period:
+            # Never multiply units/day directly by weeks! Convert both demand and lead time to a common base unit.
+            lt_conv = None
+            period = period_d or "day"
+
+            if avg_lt is not None:
+                if period_d == "day" and period_lt == "week":
+                    # Convert lead time from weeks to days using 7 calendar days/week
+                    orig_lt = avg_lt
+                    avg_lt = avg_lt * 7.0
+                    orig_std_lt = std_lt
+                    if std_lt is not None and std_lt > 0:
+                        std_lt = std_lt * 7.0
+                        lt_conv = (
+                            f"Converted {orig_lt:.1f} weeks lead time to {avg_lt:.1f} days and "
+                            f"{orig_std_lt:.2f} weeks std dev to {std_lt:.2f} days "
+                            f"(at 7 calendar days/week; at 5 business days/week: {orig_lt * 5.0:.1f} days, std dev {orig_std_lt * 5.0:.2f} days)"
+                        )
+                    else:
+                        lt_conv = (
+                            f"Converted {orig_lt:.1f} weeks lead time to {avg_lt:.1f} days "
+                            f"(at 7 calendar days/week; at 5 business days/week: {orig_lt * 5.0:.1f} days)"
+                        )
+                    period = "day"
+                elif period_d == "day" and period_lt == "month":
+                    orig_lt = avg_lt
+                    avg_lt = avg_lt * 30.0
+                    orig_std_lt = std_lt
+                    if std_lt is not None and std_lt > 0:
+                        std_lt = std_lt * 30.0
+                        lt_conv = (
+                            f"Converted {orig_lt:.1f} months lead time to {avg_lt:.1f} days and "
+                            f"{orig_std_lt:.2f} months std dev to {std_lt:.2f} days (at 30 days/month)"
+                        )
+                    else:
+                        lt_conv = f"Converted {orig_lt:.1f} months lead time to {avg_lt:.1f} days (at 30 days/month)"
+                    period = "day"
+                elif period_d == "week" and period_lt == "day":
+                    orig_lt = avg_lt
+                    avg_lt = avg_lt / 7.0
+                    orig_std_lt = std_lt
+                    if std_lt is not None and std_lt > 0:
+                        std_lt = std_lt / 7.0
+                        lt_conv = (
+                            f"Converted {orig_lt:.1f} days lead time to {avg_lt:.2f} weeks and "
+                            f"{orig_std_lt:.2f} days std dev to {std_lt:.2f} weeks (at 7 days/week)"
+                        )
+                    else:
+                        lt_conv = f"Converted {orig_lt:.1f} days lead time to {avg_lt:.2f} weeks (at 7 days/week)"
+                    period = "week"
+                else:
+                    period = period_d if period_d else period_lt
+            else:
+                period = period_d if period_d else "day"
 
             if avg_d is None and d_info.get("annual_demand") is not None:
                 ann_d = d_info["annual_demand"]
@@ -796,6 +972,8 @@ class InventoryDecisionAgent:
                 inputs["annual_demand"] = d_info["annual_demand"]
             if demand_conv:
                 inputs["demand_conversion"] = demand_conv
+            if lt_conv:
+                inputs["lead_time_conversion"] = lt_conv
 
             # Check whether problem context implies stochastic variability or deterministic constant parameters
             has_variability = (
@@ -1094,6 +1272,7 @@ class InventoryDecisionAgent:
                 service_level=inputs.get("service_level", 0.95),
                 period_name=inputs.get("period_name", "day"),
                 demand_conversion_note=inputs.get("demand_conversion"),
+                lead_time_conversion_note=inputs.get("lead_time_conversion"),
             )
             result = calculate_rop(ss_in)
             return tool_name, result
@@ -1266,7 +1445,11 @@ class InventoryDecisionAgent:
 
         elif model_type == InventoryModelType.SAFETY_STOCK_ROP:
             r: SafetyStockROPResult = result
-            conv_str = f"\n- **Demand Normalization:** `{inputs['demand_conversion']}`" if inputs.get("demand_conversion") else ""
+            conv_str = ""
+            if inputs.get("demand_conversion"):
+                conv_str += f"\n- **Demand Normalization:** `{inputs['demand_conversion']}`"
+            if inputs.get("lead_time_conversion"):
+                conv_str += f"\n- **Lead Time Alignment:** `{inputs['lead_time_conversion']}`"
             exec_sum = (
                 f"**Recommended Safety Stock (SS):** `{r.safety_stock:,.1f} units` (buffer stock)."
                 f"{conv_str}\n"
