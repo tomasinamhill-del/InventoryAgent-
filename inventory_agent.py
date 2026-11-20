@@ -111,6 +111,13 @@ class InventoryDecisionAgent:
             if kw in text:
                 scores[InventoryModelType.QUANTITY_DISCOUNT] += 3.0
 
+        # Check if multiple price tiers / quantity breaks are present in query:
+        tiers_found = self._extract_discount_tiers(question)
+        has_multiple_tiers = len(tiers_found) >= 2
+
+        if has_multiple_tiers:
+            scores[InventoryModelType.QUANTITY_DISCOUNT] += 30.0
+
         # Look for multiple price or tier patterns e.g. "$10 for ... $9 for"
         if re.search(r"(\$\s*\d+.*){2,}", text) or re.search(r"\d+\s*[-–to]+\s*\d+", text):
             scores[InventoryModelType.QUANTITY_DISCOUNT] += 3.5
@@ -197,6 +204,18 @@ class InventoryDecisionAgent:
         # If discount tiers are present, prefer QUANTITY_DISCOUNT over pure EOQ
         if scores[InventoryModelType.QUANTITY_DISCOUNT] >= 3.0 and ("discount" in text or "tier" in text or "break" in text):
             scores[InventoryModelType.QUANTITY_DISCOUNT] += 4.0
+
+        # Intent Routing: Whenever a query mentions multiple unit price tiers / quantity breaks
+        # (e.g., "charges $12 per unit for orders below 500 units, $11.50 for 500-999 units, and $11 for orders of 1,000 units or more"),
+        # classify the model as Quantity Discount (All-Units) with high confidence (>= 95%), overriding plain EOQ.
+        if has_multiple_tiers:
+            best_model = InventoryModelType.QUANTITY_DISCOUNT
+            confidence = 0.98
+            rationale = (
+                f"Classified as Quantity Discount (All-Units) with high confidence ({int(confidence*100)}%): "
+                f"Query specifies {len(tiers_found)} quantity price tiers / volume breaks, overriding plain EOQ."
+            )
+            return (best_model, confidence, rationale)
 
         best_model = max(scores, key=lambda m: scores[m])
         best_score = scores[best_model]
@@ -741,6 +760,166 @@ class InventoryDecisionAgent:
 
         return csl, z
 
+    def _extract_discount_tiers(self, text: str) -> List[DiscountTier]:
+        """
+        Extracts all-units discount tiers from natural language text supporting:
+        1. Price-first patterns:
+           - "$12 per unit for orders below 500 units" -> min 1, max 499, price 12.0
+           - "$11.50 for 500-999 units" -> min 500, max 999, price 11.5
+           - "$11 for orders of 1,000 units or more" -> min 1000, max None, price 11.0
+           - "$12 for orders under 500 units" -> min 1, max 499, price 12.0
+           - "$12 up to 499 units" -> min 1, max 499, price 12.0
+        2. Quantity-first patterns:
+           - "1 to 499 units @ $10.00" -> min 1, max 499, price 10.0
+           - "under 500 units @ $10" -> min 1, max 499, price 10.0
+           - "500 to 999 units @ $9.50" / "500-999 units @ $9.50" -> min 500, max 999, price 9.5
+           - "1000+ units @ $9.00" / "1,000 units or more @ $11" -> min 1000, max None, price 9.0/11.0
+        3. Table / Colon formats:
+           - "1-499: $10, 500-999: $9.50, 1000+: $9.00"
+        Returns a sorted, deduplicated, and contiguous List[DiscountTier].
+        """
+        # Strategy 1: Price first patterns
+        price_first_tiers: List[DiscountTier] = []
+
+        # 1a. Low tier: $PRICE ... (below|under|less than|fewer than) Q
+        p_low_below = (
+            r"\$\s*([\d,]+(?:\.\d+)?)\s*(?:per\s+unit|\/unit|each|a\s+unit)?\s*"
+            r"(?:for|at|on|when\s+ordering)?\s*(?:orders\s+(?:of|for)?\s*)?"
+            r"(?:below|<|less\s+than|under|fewer\s+than)\s*([\d,]+)\s*(?:units|items|pieces|cases)?"
+        )
+        for m in re.finditer(p_low_below, text, re.IGNORECASE):
+            price = self._clean_number(m.group(1))
+            below_q = self._clean_number(m.group(2))
+            if price is not None and below_q is not None and below_q > 1:
+                max_q = below_q - 1.0
+                price_first_tiers.append(DiscountTier(min_qty=1.0, max_qty=max_q, unit_price=price, tier_name=f"1 to {int(max_q)}"))
+
+        # 1b. Low tier: $PRICE ... (up to|0 to|1 to) Q
+        p_low_upto = (
+            r"\$\s*([\d,]+(?:\.\d+)?)\s*(?:per\s+unit|\/unit|each|a\s+unit)?\s*"
+            r"(?:for|at|on|when\s+ordering)?\s*(?:orders\s+(?:of|for)?\s*)?"
+            r"(?:up\s+to|0\s*(?:-|to)|1\s*(?:-|to))\s*([\d,]+)\s*(?:units|items|pieces|cases)?"
+        )
+        for m in re.finditer(p_low_upto, text, re.IGNORECASE):
+            price = self._clean_number(m.group(1))
+            upto_q = self._clean_number(m.group(2))
+            if price is not None and upto_q is not None and upto_q >= 1:
+                price_first_tiers.append(DiscountTier(min_qty=1.0, max_qty=upto_q, unit_price=price, tier_name=f"1 to {int(upto_q)}"))
+
+        # 1c. Range tier: $PRICE ... (between )? Q1 (-|to) Q2
+        p_range = (
+            r"\$\s*([\d,]+(?:\.\d+)?)\s*(?:per\s+unit|\/unit|each|a\s+unit)?\s*"
+            r"(?:for|at|on|when\s+ordering)\s*(?:orders\s+(?:of|for|between)?\s*)?"
+            r"(?:between\s+)?([\d,]+)\s*(?:-|–|to)\s*([\d,]+)\s*(?:units|items|pieces|cases)?"
+        )
+        for m in re.finditer(p_range, text, re.IGNORECASE):
+            price = self._clean_number(m.group(1))
+            q1 = self._clean_number(m.group(2))
+            q2 = self._clean_number(m.group(3))
+            if price is not None and q1 is not None and q2 is not None:
+                price_first_tiers.append(DiscountTier(min_qty=q1, max_qty=q2, unit_price=price, tier_name=f"{int(q1)} to {int(q2)}"))
+
+        # 1d. High tier: $PRICE ... Q or more / Q+ / over Q
+        p_high = (
+            r"\$\s*([\d,]+(?:\.\d+)?)\s*(?:per\s+unit|\/unit|each|a\s+unit)?\s*"
+            r"(?:for|at|on|when\s+ordering)\s*(?:orders\s+(?:of|for)?\s*)?"
+            r"(?:(?:orders\s+of\s+)?([\d,]+)\s*(?:units|items|pieces|cases)?\s*(?:\+|or\s+more|and\s+above|and\s+over|\bplus\b)|(?:orders\s+(?:of|for)?\s*)?(?:over|>|greater\s+than|exceeding)\s*([\d,]+)\s*(?:units|items)?)"
+        )
+        for m in re.finditer(p_high, text, re.IGNORECASE):
+            price = self._clean_number(m.group(1))
+            q = self._clean_number(m.group(2)) or self._clean_number(m.group(3))
+            if price is not None and q is not None:
+                price_first_tiers.append(DiscountTier(min_qty=q, max_qty=None, unit_price=price, tier_name=f"{int(q)}+"))
+
+        if len(price_first_tiers) >= 2:
+            seen: Dict[float, DiscountTier] = {}
+            for t in price_first_tiers:
+                seen[t.min_qty] = t
+            unique_tiers = list(seen.values())
+            unique_tiers.sort(key=lambda t: t.min_qty)
+            return self._normalize_contiguous_tiers(unique_tiers)
+
+        # Strategy 2: Quantity first patterns
+        # e.g., "1 to 499 units @ $10.00", "500 to 999 units @ $9.50", "1000+ units @ $9.00"
+        qty_first_tiers: List[DiscountTier] = []
+        candidates = re.findall(
+            r"(?:(?:under|<|less\s+than|up\s+to|below|0\s*(?:-|to))\s*([\d,]+)\s*(?:units|items)?\s*(?:@|cost|costs|for|at|:|is|=|are)?\s*\$?\s*(\d+(?:\.\d+)?))|"
+            r"(?:(?:orders\s+of\s+)?([\d,]+)\s*(?:-|–|to)\s*([\d,]+)\s*(?:units|items)?\s*(?:@|cost|costs|for|at|:|is|=|are)?\s*\$?\s*(\d+(?:\.\d+)?))|"
+            r"(?:(?:orders\s+of\s+)?([\d,]+)\s*(?:\+|or\s+more|and\s+above|\s*and\s*over)\s*(?:units|items)?\s*(?:@|cost|costs|for|at|:|is|=|are)?\s*\$?\s*(\d+(?:\.\d+)?))",
+            text,
+            re.IGNORECASE,
+        )
+        for g in candidates:
+            if g[0] and g[1]:
+                raw_q = self._clean_number(g[0])
+                price = self._clean_number(g[1])
+                if raw_q is not None and price is not None:
+                    max_q = raw_q - 1.0 if raw_q > 1 else raw_q
+                    qty_first_tiers.append(DiscountTier(min_qty=1.0, max_qty=max_q, unit_price=price, tier_name=f"1 to {int(max_q)}"))
+            elif g[2] and g[3] and g[4]:
+                q1 = self._clean_number(g[2])
+                q2 = self._clean_number(g[3])
+                price = self._clean_number(g[4])
+                if q1 is not None and q2 is not None and price is not None:
+                    qty_first_tiers.append(DiscountTier(min_qty=q1, max_qty=q2, unit_price=price, tier_name=f"{int(q1)} to {int(q2)}"))
+            elif g[5] and g[6]:
+                q = self._clean_number(g[5])
+                price = self._clean_number(g[6])
+                if q is not None and price is not None:
+                    qty_first_tiers.append(DiscountTier(min_qty=q, max_qty=None, unit_price=price, tier_name=f"{int(q)}+"))
+
+        if len(qty_first_tiers) >= 2:
+            seen = {}
+            for t in qty_first_tiers:
+                seen[t.min_qty] = t
+            unique_tiers = list(seen.values())
+            unique_tiers.sort(key=lambda t: t.min_qty)
+            return self._normalize_contiguous_tiers(unique_tiers)
+
+        # Strategy 3: Table / Colon format e.g. "1-499: $10, 500-999: $9.50, 1000+: $9.00"
+        table_matches = re.findall(
+            r"([\d,]+)\s*(?:-|–|to)\s*([\d,]+|\+)?\s*(?:units)?\s*[:@=]\s*\$?\s*(\d+(?:\.\d+)?)",
+            text,
+            re.IGNORECASE,
+        )
+        table_tiers: List[DiscountTier] = []
+        for m_min, m_max, m_price in table_matches:
+            min_q = self._clean_number(m_min)
+            max_q = self._clean_number(m_max) if m_max and m_max != "+" else None
+            price = self._clean_number(m_price)
+            if min_q is not None and price is not None:
+                tier_name = f"{int(min_q)} to {int(max_q)}" if max_q else f"{int(min_q)}+"
+                table_tiers.append(DiscountTier(min_qty=min_q, max_qty=max_q, unit_price=price, tier_name=tier_name))
+
+        if len(table_tiers) >= 2:
+            seen = {}
+            for t in table_tiers:
+                seen[t.min_qty] = t
+            unique_tiers = list(seen.values())
+            unique_tiers.sort(key=lambda t: t.min_qty)
+            return self._normalize_contiguous_tiers(unique_tiers)
+
+        return []
+
+    def _normalize_contiguous_tiers(self, tiers: List[DiscountTier]) -> List[DiscountTier]:
+        """Ensures the tier schedule starts at 1 and has contiguous non-overlapping bounds."""
+        if not tiers:
+            return []
+        tiers.sort(key=lambda t: t.min_qty)
+        if tiers[0].min_qty <= 0:
+            tiers[0].min_qty = 1.0
+        for idx in range(len(tiers)):
+            t = tiers[idx]
+            if idx < len(tiers) - 1:
+                next_t = tiers[idx + 1]
+                if t.max_qty is None or t.max_qty >= next_t.min_qty:
+                    t.max_qty = next_t.min_qty - 1.0
+                t.tier_name = f"{int(t.min_qty)} to {int(t.max_qty)}"
+            else:
+                t.max_qty = None
+                t.tier_name = f"{int(t.min_qty)}+"
+        return tiers
+
     def extract_inputs(self, question: str, model_type: InventoryModelType) -> Tuple[Dict[str, Any], List[str]]:
         """
         Extracts required and optional parameters from the natural language question.
@@ -801,64 +980,14 @@ class InventoryDecisionAgent:
             f_h, pct_h, h_note = self._extract_holding_cost(text, work_days=work_days, return_note=True)
             unit_price = self._extract_unit_price(text)
 
-            # Extract discount tiers
-            tiers: List[DiscountTier] = []
-
-            # Pattern A: e.g. "under 500 units @ $10", "1 to 499 units @ $10.00", "1000+ units @ $9.00"
-            tier_candidates = re.findall(
-                r"(?:(?:under|<|less\s+than|up\s+to|0\s*(?:-|to))\s*([\d,]+)\s*(?:units)?\s*(?:@|cost|costs|for|at|:|=)?\s*\$?\s*(\d+(?:\.\d+)?))|"
-                r"(?:([\d,]+)\s*(?:-|–|to)\s*([\d,]+)\s*(?:units)?\s*(?:@|cost|costs|for|at|:|=)?\s*\$?\s*(\d+(?:\.\d+)?))|"
-                r"(?:([\d,]+)\s*(?:\+|or\s+more|and\s+above|\s*and\s*over)\s*(?:units)?\s*(?:@|cost|costs|for|at|:|=)?\s*\$?\s*(\d+(?:\.\d+)?))",
-                text,
-                re.IGNORECASE
-            )
-
-            if tier_candidates:
-                for group in tier_candidates:
-                    if group[0] and group[1]:
-                        max_q = float(group[0].replace(",", "")) - 1.0
-                        price = float(group[1].replace(",", "").rstrip(".,;:!?"))
-                        tiers.append(DiscountTier(min_qty=1.0, max_qty=max_q, unit_price=price, tier_name=f"1 to {int(max_q)}"))
-                    elif group[2] and group[3] and group[4]:
-                        min_q = float(group[2].replace(",", ""))
-                        max_q = float(group[3].replace(",", ""))
-                        price = float(group[4].replace(",", "").rstrip(".,;:!?"))
-                        tiers.append(DiscountTier(min_qty=min_q, max_qty=max_q, unit_price=price, tier_name=f"{int(min_q)} to {int(max_q)}"))
-                    elif group[5] and group[6]:
-                        min_q = float(group[5].replace(",", ""))
-                        price = float(group[6].replace(",", "").rstrip(".,;:!?"))
-                        tiers.append(DiscountTier(min_qty=min_q, max_qty=None, unit_price=price, tier_name=f"{int(min_q)}+"))
-
-            # Pattern B: table-like formats: e.g. "1-499: $10, 500-999: $9.50, 1000+: $9.00"
-            if not tiers:
-                table_matches = re.findall(
-                    r"([\d,]+)\s*(?:-|–|to)\s*([\d,]+|\+)?\s*(?:units)?\s*[:@=]\s*\$?\s*(\d+(?:\.\d+)?)",
-                    text,
-                    re.IGNORECASE
-                )
-                for m_min, m_max, m_price in table_matches:
-                    min_q = float(m_min.replace(",", ""))
-                    max_q = float(m_max.replace(",", "")) if m_max and m_max != "+" else None
-                    price = float(m_price.replace(",", "").rstrip(".,;:!?"))
-                    tier_name = f"{int(min_q)} to {int(max_q)}" if max_q else f"{int(min_q)}+"
-                    tiers.append(DiscountTier(min_qty=min_q, max_qty=max_q, unit_price=price, tier_name=tier_name))
-
-            # Pattern C: Price breaks with quantities: e.g. "$10 for 1-499, $9.50 for 500-999, $9 for 1000+"
-            if not tiers:
-                inv_matches = re.findall(
-                    r"\$?\s*(\d+(?:\.\d+)?)\s*(?:for|at)?\s*(?:orders\s+of\s+)?([\d,]+)\s*(?:-|–|to)\s*([\d,]+|\+)?\s*(?:units)?",
-                    text,
-                    re.IGNORECASE
-                )
-                for m_price, m_min, m_max in inv_matches:
-                    price = float(m_price.replace(",", "").rstrip(".,;:!?"))
-                    min_q = float(m_min.replace(",", ""))
-                    max_q = float(m_max.replace(",", "")) if m_max and m_max != "+" else None
-                    tier_name = f"{int(min_q)} to {int(max_q)}" if max_q else f"{int(min_q)}+"
-                    tiers.append(DiscountTier(min_qty=min_q, max_qty=max_q, unit_price=price, tier_name=tier_name))
-
-            # Sort tiers by min_qty
-            tiers.sort(key=lambda t: t.min_qty)
+            # Extract discount tiers using unified extractor
+            tiers = self._extract_discount_tiers(text)
+            if tiers:
+                inputs["tiers"] = tiers
+                if unit_price is None:
+                    unit_price = tiers[0].unit_price
+            else:
+                missing.append("discount_tiers")
 
             if d is not None:
                 inputs["annual_demand"] = d
@@ -882,11 +1011,6 @@ class InventoryDecisionAgent:
                     inputs["holding_conversion"] = h_note
             else:
                 missing.append("holding_rate or fixed_holding_cost")
-
-            if tiers:
-                inputs["tiers"] = tiers
-            else:
-                missing.append("discount_tiers")
 
             if unit_price is not None:
                 inputs["unit_purchase_price"] = unit_price

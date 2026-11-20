@@ -184,3 +184,105 @@ When queries specified demand rates with non-annual time units (e.g., `"Demand i
   - $\text{Reorder Point (ROP)} = \mu_{DLT} + \text{SS} = 840.0 + 238.04 \approx 1,078.04 \approx \mathbf{1,078.0 \text{ units}}$
   - $\text{Operational Case} = \mathbf{variable\_demand\_and\_variable\_lead\_time}$
   - Verification Invariant $\text{lead\_time\_variability\_included} = \mathbf{PASS \ (True)}$
+
+
+## Bug-Fix 2026-11-19: Quantity Discount Intent Routing & Price-First Tier Extraction
+
+### 1. Summary
+- **Modules Affected**: [`inventory_agent.py`](file:///Users/tomasinahill/Downloads/Inventory%20Agent/inventory_agent.py), [`streamlit_app.py`](file:///Users/tomasinahill/Downloads/Inventory%20Agent/streamlit_app.py), [`tests/test_inventory_tools.py`](file:///Users/tomasinahill/Downloads/Inventory%20Agent/tests/test_inventory_tools.py), [`tests/test_streamlit_app.py`](file:///Users/tomasinahill/Downloads/Inventory%20Agent/tests/test_streamlit_app.py)
+- **Functions Modified**: `identify_model()`, `extract_inputs()`, `_extract_discount_tiers()`, `_normalize_contiguous_tiers()`, `explain_result()`
+- **Tests Added**:
+  - `test_agent_quantity_discount_test_8` in [`tests/test_inventory_tools.py`](file:///Users/tomasinahill/Downloads/Inventory%20Agent/tests/test_inventory_tools.py)
+  - `test_price_first_tier_extraction_phrasings` in [`tests/test_inventory_tools.py`](file:///Users/tomasinahill/Downloads/Inventory%20Agent/tests/test_inventory_tools.py)
+  - `test_quantity_discount_intent_routing_overrides_eoq` in [`tests/test_inventory_tools.py`](file:///Users/tomasinahill/Downloads/Inventory%20Agent/tests/test_inventory_tools.py)
+  - `test_quantity_discount_test_8_audit_and_ui_rendering` in [`tests/test_streamlit_app.py`](file:///Users/tomasinahill/Downloads/Inventory%20Agent/tests/test_streamlit_app.py)
+- **Issue Classification**: Intent Classification Routing & Multi-Tier Entity Extraction Defect
+
+---
+
+### 2. Defect Description & Impact
+1. **Misclassification as Plain EOQ**:
+   When natural-language queries specified multi-tiered volume pricing schedules with phrasing like:
+   *"The supplier charges \$12 per unit for orders below 500 units, \$11.50 for 500-999 units, and \$11 for orders of 1,000 units or more. Find the best order quantity and annual cost."*
+   The intent classifier scored keywords like `"annual demand"`, `"ordering cost"`, and `"best order quantity"`, which heavily favored standard single-item EOQ. The query was routed to `calculate_eoq`, ignoring the price tiers entirely and calculating a single incorrect EOQ based on an arbitrarily selected base price.
+2. **Price-First Syntax Unhandled**:
+   Older extraction regexes only recognized quantity-first syntax (e.g., `"1 to 499 units @ \$10"` or `"1-499: \$10"`). Natural English price-first schedules (e.g., `"\$12 per unit for orders below 500 units"`, `"\$11.50 for 500-999 units"`, `"\$11 for orders of 1,000 units or more"`) failed extraction, resulting in empty tier lists.
+
+---
+
+### 3. Fix Implementation
+
+1. **Intent Routing Override for Multi-Tier Schedules**:
+   In `identify_model()`, queries are inspected for multi-tiered price breaks via `self._extract_discount_tiers(question)`.
+   Whenever `len(tiers_found) >= 2`, the model classification immediately locks to `InventoryModelType.QUANTITY_DISCOUNT` with high confidence ($\ge 95\%$, specifically `0.98`) and explicit rationale:
+   ```python
+   if has_multiple_tiers:
+       best_model = InventoryModelType.QUANTITY_DISCOUNT
+       confidence = 0.98
+       rationale = (
+           f"Classified as Quantity Discount (All-Units) with high confidence ({int(confidence*100)}%): "
+           f"Query specifies {len(tiers_found)} quantity price tiers / volume breaks, overriding plain EOQ."
+       )
+       return (best_model, confidence, rationale)
+   ```
+
+2. **Comprehensive Price-First Tier Extraction**:
+   Implemented `_extract_discount_tiers()` supporting three distinct pricing syntaxes:
+   - **Strategy 1 (Price-First)**: Parses:
+     - `"\$12 per unit for orders below 500 units"` $\rightarrow \text{min}=1.0, \text{max}=499.0, \text{price}=\$12.00$
+     - `"\$11.50 for 500-999 units"` $\rightarrow \text{min}=500.0, \text{max}=999.0, \text{price}=\$11.50$
+     - `"\$11 for orders of 1,000 units or more"` $\rightarrow \text{min}=1000.0, \text{max}=\text{None}, \text{price}=\$11.00$
+     - Requires connector words (`for`, `at`, `on`, `when ordering`) to prevent false cross-clause matches.
+   - **Strategy 2 (Quantity-First)**: Parses `"1 to 499 units @ \$10.00"`, `"500-999 units @ \$9.50"`, `"1000+ units @ \$9.00"`.
+   - **Strategy 3 (Table / Colon)**: Parses `"1-499: \$10, 500-999: \$9.50, 1000+: \$9.00"`.
+
+3. **Contiguous Tier Normalization**:
+   Implemented `_normalize_contiguous_tiers()` to guarantee:
+   - Lowest tier minimum quantity starts at $1.0$.
+   - Any gap between tiers is closed contiguously.
+   - Highest tier upper bound is set to `None` (unbounded upper threshold).
+
+---
+
+### 4. Verification with Exact Test 8 Prompt
+
+- **Prompt**:
+  > *"Annual demand is 5,000 units. Ordering cost is \$60 per order and annual holding cost is 20% of unit cost. The supplier charges \$12 per unit for orders below 500 units, \$11.50 for 500-999 units, and \$11 for orders of 1,000 units or more. Find the best order quantity and annual cost."*
+
+- **Extracted Inputs**:
+  - $D = 5,000 \text{ units/year}$
+  - $S = \$60.00/\text{order}$
+  - $i = 0.20$ ($20\%$ annual holding cost rate)
+  - Tier 1: $1 \le Q \le 499 \quad \rightarrow C_1 = \$12.00$
+  - Tier 2: $500 \le Q \le 999 \quad \rightarrow C_2 = \$11.50$
+  - Tier 3: $Q \ge 1,000 \quad \rightarrow C_3 = \$11.00$
+
+- **All-Units Feasibility & Total Cost Evaluation**:
+  1. **Tier 1 (\$12.00/unit)**:
+     $$H_1 = 0.20 \times \$12.00 = \$2.40/\text{unit/year}$$
+     $$\text{Raw EOQ}_1 = \sqrt{\frac{2 \times 5,000 \times 60}{2.40}} = 500.0 \text{ units}$$
+     $500.0 > 499 \implies$ **Infeasible** (outside tier upper bound).
+  2. **Tier 2 (\$11.50/unit)**:
+     $$H_2 = 0.20 \times \$11.50 = \$2.30/\text{unit/year}$$
+     $$\text{Raw EOQ}_2 = \sqrt{\frac{2 \times 5,000 \times 60}{2.30}} \approx 510.75 \text{ units} \in [500, 999] \implies \mathbf{Feasible}$$
+     $$\text{Purchase Cost} = 5,000 \times \$11.50 = \$57,500.00$$
+     $$\text{Ordering Cost} = \frac{5,000}{510.75} \times \$60 \approx \$587.37$$
+     $$\text{Holding Cost} = \frac{510.75}{2} \times \$2.30 \approx \$587.37$$
+     $$\text{Total Cost}_2 = \$57,500.00 + \$587.37 + \$587.37 = \mathbf{\$58,674.73}$$
+  3. **Tier 3 (\$11.00/unit)**:
+     $$H_3 = 0.20 \times \$11.00 = \$2.20/\text{unit/year}$$
+     $$\text{Raw EOQ}_3 = \sqrt{\frac{2 \times 5,000 \times 60}{2.20}} \approx 522.23 \text{ units} < 1,000 \implies \text{Infeasible}$$
+     Adjust upward to price break threshold: $Q_3^* = \mathbf{1,000.0 \text{ units}}$
+     $$\text{Purchase Cost} = 5,000 \times \$11.00 = \$55,000.00$$
+     $$\text{Ordering Cost} = \frac{5,000}{1,000} \times \$60 = \$300.00$$
+     $$\text{Holding Cost} = \frac{1,000}{2} \times \$2.20 = \$1,100.00$$
+     $$\text{Total Cost}_3 = \$55,000.00 + \$300.00 + \$1,100.00 = \mathbf{\$56,400.00}$$
+
+- **Agent Decision & Results**:
+  - **Identified Model**: `QUANTITY_DISCOUNT`
+  - **Confidence**: `98%` ($\ge 95\%$)
+  - **Selected Tool**: `inventory_tools.calculate_quantity_discount`
+  - **Optimal Order Quantity**: $\mathbf{1,000.0 \text{ units}}$ (qualifying for Tier 3 at $\mathbf{\$11.00/\text{unit}}$)
+  - **Minimum Total Annual Cost**: $\mathbf{\$56,400.00}$
+  - **Annual Savings vs Base Tier**: $\mathbf{\$4,700.00}$ ($7.69\%$ reduction)
+  - **Verification Status**: `is_verified = True`, `has_feasible_solution = True`

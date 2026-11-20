@@ -18,8 +18,8 @@ flowchart LR
 
 The agent executes a deterministic 7-stage workflow:
 1. **Customer Question**: Free-form natural-language input from inventory managers.
-2. **Identify Model**: Multi-signal classification across 5 supported inventory models.
-3. **Extract Inputs**: Robust parsing of units, intervals, currencies, percentages, and quantity discount schedules, with automatic time-unit normalization:
+2. **Identify Model**: Multi-signal classification across 5 supported inventory models with automatic intent override for multi-tier pricing schedules ($\ge 95\%$ confidence routing to Quantity Discount over plain EOQ).
+3. **Extract Inputs**: Robust parsing of units, intervals, currencies, percentages, and quantity discount schedules (price-first, quantity-first, and colon/table formats), with automatic time-unit normalization:
    - **Monthly demand**: Multiplied by 12 ($1,000\text{ units/month} \times 12 = 12,000\text{ units/year}$).
    - **Weekly demand**: Multiplied by 52 ($250\text{ units/week} \times 52 = 13,000\text{ units/year}$).
    - **Daily demand**: Multiplied by operating days ($40\text{ units/day} \times 250\text{ work days/year} = 10,000\text{ units/year}$, or $\times 365$ for calendar days).
